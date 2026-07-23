@@ -1,24 +1,79 @@
 #!/usr/bin/env python3
 
 """
-Standalone Bluesky posting helper for text, rich-text facets, replies, images,
-external cards, quote records, and record-with-media embeds.
+Standalone Bluesky posting helper.
 
-Bluesky posting helper adapted from Bryan Newbold's original script:
+This is a security-hardened fork of Bryan Newbold's original create_bsky_post.py cookbook script:
 
  https://github.com/bluesky-social/cookbook/blob/main/python-bsky-post/create_bsky_post.py
  https://gist.github.com/bnewbold
  https://bsky.app/profile/bnewbold.net
 
  Fork:
- 
+
  https://github.com/CleasbyCode/cookbook/blob/main/python-bsky-post/create_bsky_post.py
  https://gist.github.com/CleasbyCode/1eb678ca1fa1975b1c1e20aeec33637e
 
-Supports hashtags, per-image alt text, and Pillow-derived aspect ratios.
+Features:
 
-Requires: requests, beautifulsoup4, pillow
+ * Text posts with rich-text facets: links, @mentions (resolved to DIDs),
+   hashtags (including fullwidth ＃) and cashtags (e.g. $TSLA)
+
+ * Replies to existing posts (--reply-to)
+
+ * Up to 4 attached images (--image) with per-image alt text (--alt-text)
+   and Pillow-derived aspect ratios
+
+ * External link cards (--embed-url) built from Open Graph metadata,
+   including the og:image thumbnail
+
+ * Quote records (--embed-ref) for posts, lists, and feed generators,
+   optionally combined with images or a link card (record-with-media)
+
+ * BCP 47 language tags (--lang, up to 3)
+
+ * Custom PDS (--pds-url) and record lookup service (--record-service-url)
+
+ * Built-in self-tests (--self-test) and verbose diagnostics (--verbose)
+
+Security hardening over the original script:
+
+ * SSRF protection for all attacker-influenced fetches (embed pages,
+   redirects, og:image): DNS is resolved once, every answer must be a
+   public unicast address, and connections are pinned to the validated IP
+   while still authenticating the original TLS hostname
+
+ * Bounded redirects with per-hop revalidation and HTTPS-to-HTTP
+   downgrade refusal; redirects on credential-bearing requests rejected
+
+ * Wall-clock deadlines on every network operation, response size caps,
+   and refusal of compressed remote bodies
+
+ * Strict validation of AT URIs, record CIDs, handles, language tags,
+   image files (symlink-safe reads, dimension/pixel limits), and URLs
+
+Setup:
+
+ Requires: requests, beautifulsoup4, pillow
     $ pip install requests beautifulsoup4 pillow
+
+ Set your credentials as environment variables:
+    $ export ATP_AUTH_HANDLE='your-handle.bsky.social'
+    $ export ATP_AUTH_PASSWORD='xxxx-xxxx-xxxx-xxxx'
+
+ IMPORTANT: ATP_AUTH_PASSWORD should be an APP password, created at
+ https://bsky.app/settings/app-passwords — do NOT use your main Bluesky
+ account password. App passwords can be revoked individually and cannot
+ change account settings.
+
+Examples:
+
+    $ python3 create_bsky_post.py "Hello, Bluesky! #greetings"
+    $ python3 create_bsky_post.py "Sunset over the bay" --image sunset.jpg --alt-text "Orange sunset over a calm bay"
+    $ python3 create_bsky_post.py "Worth a read" --embed-url "https://example.com/article"
+    $ python3 create_bsky_post.py "Replying" --reply-to "at://did:plc:xxx/app.bsky.feed.post/yyy"
+    $ python3 create_bsky_post.py "Quoting this post" --embed-ref "https://bsky.app/profile/example.com/post/yyy"
+    $ python3 create_bsky_post.py "Quoted with media" --embed-ref "at://did:plc:xxx/app.bsky.feed.post/yyy" --image photo.jpg
 """
 
 from __future__ import annotations
@@ -58,7 +113,6 @@ DEFAULT_PDS_URL = "https://bsky.social"
 DEFAULT_RECORD_SERVICE_URL = "https://public.api.bsky.app"
 MAX_IMAGES_PER_POST = 4
 MAX_IMAGE_SIZE_BYTES = 2_000_000
-MAX_POST_GRAPHEMES = 300
 MAX_POST_BYTES = 3_000
 MAX_TAG_GRAPHEMES = 64
 MAX_TAG_BYTES = 640
@@ -256,6 +310,15 @@ def normalize_service_url(
     service_name: str,
     allow_insecure: bool = False,
 ) -> str:
+    # Service URLs (PDS, record service) are a trusted boundary: they are
+    # operator-supplied endpoints, never attacker-influenced, so they are only
+    # scheme/host normalized and are deliberately NOT run through the public-IP
+    # SSRF check that guards attacker-influenced fetches (embed URLs, redirects,
+    # og:image). The PDS additionally receives the user's credentials; the
+    # record service carries none (getRecord is unauthenticated) but is still
+    # operator-chosen, so aiming either at a private address is a deliberate
+    # operator decision (e.g. local testing), not an SSRF vector reachable by
+    # post content. Enforce HTTPS unless explicitly opted out for loopback.
     parsed = _parse_url(service_url.strip(), schemes=("http", "https"))
     if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
         raise ValueError(
@@ -299,7 +362,15 @@ def _run_before_download_deadline(
     *,
     dispose_abandoned: Optional[Callable[[Any], None]] = None,
 ) -> Any:
-    """Run one blocking operation without allowing it past the total deadline."""
+    """Run one blocking operation without allowing it past the total deadline.
+
+    On timeout the blocking call is abandoned in its daemon worker thread while
+    the caller raises requests.Timeout. That worker may still be touching the
+    shared _SESSION, which is not thread-safe, so any timeout MUST unwind all
+    the way to main() and terminate the process rather than be caught and
+    followed by another request that reuses _SESSION. _resolve_handle relies on
+    this by re-raising Timeout instead of swallowing it.
+    """
     outcome: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
     state_lock = threading.Lock()
     abandoned = [False]
@@ -1317,12 +1388,26 @@ def _read_image_file(path: Path) -> bytes:
     flags = os.O_RDONLY
     for flag_name in ("O_CLOEXEC", "O_NONBLOCK", "O_NOFOLLOW"):
         flags |= getattr(os, flag_name, 0)
+    have_nofollow = hasattr(os, "O_NOFOLLOW")
+    pre_open_info: Optional[os.stat_result] = None
     file_descriptor = -1
     try:
-        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():
-            raise ValueError(f"Image path must not be a symbolic link: {path}")
+        if not have_nofollow:
+            # No O_NOFOLLOW on this platform, so the open() below would follow a
+            # symlink. Reject any symlink up front, then re-check after opening
+            # that we got the very inode we lstat'd. Comparing (st_dev, st_ino)
+            # closes the lstat->open TOCTOU window: if the path was swapped for a
+            # symlink (or anything else) in between, the identity check fails.
+            pre_open_info = os.lstat(path)
+            if stat.S_ISLNK(pre_open_info.st_mode):
+                raise ValueError(f"Image path must not be a symbolic link: {path}")
         file_descriptor = os.open(path, flags)
         file_info = os.fstat(file_descriptor)
+        if pre_open_info is not None and (
+            file_info.st_dev != pre_open_info.st_dev
+            or file_info.st_ino != pre_open_info.st_ino
+        ):
+            raise ValueError(f"Image path changed while opening: {path}")
         if not stat.S_ISREG(file_info.st_mode):
             raise ValueError(f"Image path is not a regular file: {path}")
         if file_info.st_size > MAX_IMAGE_SIZE_BYTES:
@@ -1382,10 +1467,47 @@ def upload_images(
     return {"$type": "app.bsky.embed.images", "images": images}
 
 
+_ZERO_WIDTH_JOINER = "\u200d"
+_VARIATION_SELECTORS = frozenset(chr(cp) for cp in range(0xFE00, 0xFE10))
+
+
+def _extends_previous_cluster(character: str) -> bool:
+    """Best-effort test for whether `character` attaches to the preceding base.
+
+    The stdlib has no UAX #29 grapheme segmentation, so this only recognizes the
+    backward-attaching extenders that would make an obviously broken boundary if
+    left behind: combining marks (category M*) and emoji variation selectors. The
+    zero-width joiner joins forward, so a dropped leading ZWJ does not corrupt the
+    kept prefix; a dangling trailing ZWJ is handled separately by the caller.
+    """
+    return character in _VARIATION_SELECTORS or unicodedata.category(
+        character
+    ).startswith("M")
+
+
+def _grapheme_safe_prefix(text: str, limit: int) -> str:
+    """Return at most `limit` code points without splitting a grapheme cluster.
+
+    This is a conservative, stdlib-only approximation (regional-indicator flag
+    pairs, for example, are not tracked); the PDS enforces the authoritative
+    grapheme count, so this only needs to avoid emitting an obviously broken
+    cluster at the truncation boundary.
+    """
+    if len(text) <= limit:
+        return text
+    cut = limit
+    while cut > 0 and (
+        _extends_previous_cluster(text[cut])
+        or text[cut - 1] == _ZERO_WIDTH_JOINER
+    ):
+        cut -= 1
+    return text[:cut]
+
+
 def _trim_card_text(value: Any, limit: int) -> str:
     if not isinstance(value, str):
         return ""
-    return value.strip()[:limit]
+    return _grapheme_safe_prefix(value.strip(), limit)
 
 
 def _meta_content(soup: BeautifulSoup, property_name: str) -> str:
@@ -1444,6 +1566,11 @@ def _attach_external_thumb(
             image_info["mimetype"],
         )
     except (requests.RequestException, ValueError):
+        # Swallowing requests.Timeout here is safe (and intentional), unlike the
+        # API paths that must let it propagate: _safe_download uses its own
+        # freshly-created sessions, so an abandoned daemon worker from a timed-out
+        # download cannot be touching the shared _SESSION that createRecord reuses
+        # next. A failed thumbnail must not abort an otherwise valid post.
         print(
             f"warning: could not embed og:image {_url_for_log(img_url)!r}.",
             file=sys.stderr,
@@ -2100,6 +2227,20 @@ def test_get_reply_refs_reuses_root_ref():
     })
 
 
+def test_trim_card_text():
+    _check_equal(_trim_card_text("  hello  ", 300), "hello")
+    _check_equal(_trim_card_text(None, 300), "")
+    _check_equal(_trim_card_text("abcdef", 4), "abcd")
+    # Do not slice between a base letter and its combining acute accent.
+    _check_equal(_trim_card_text("abce\u0301", 4), "abc")
+    # Do not leave a dangling zero-width joiner at the boundary.
+    _check_equal(_trim_card_text("ab\u200dcd", 3), "ab")
+    # A base + variation selector cluster is kept together when it fits...
+    _check_equal(_trim_card_text("c\ufe0fdef", 3), "c\ufe0fd")
+    # ...and the bare base is dropped rather than split when it does not.
+    _check_equal(_trim_card_text("abc\ufe0f", 3), "ab")
+
+
 def run_self_tests() -> None:
     for test in (
         test_parse_mentions,
@@ -2118,6 +2259,7 @@ def run_self_tests() -> None:
         test_inspect_image,
         test_read_response_body_limits,
         test_get_reply_refs_reuses_root_ref,
+        test_trim_card_text,
     ):
         test()
 
@@ -2157,7 +2299,7 @@ def _validate_text_length(text: str) -> None:
             f"(got {byte_length:,} bytes)."
         )
     # Extended grapheme segmentation is not available in Python's standard
-    # library. The PDS enforces the separate MAX_POST_GRAPHEMES schema limit.
+    # library, so the separate 300-grapheme schema limit is enforced by the PDS.
 
 
 def _is_valid_language_tag(language_tag: str) -> bool:
