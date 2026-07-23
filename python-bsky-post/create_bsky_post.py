@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Script demonstrating how to create posts using the Bluesky API, covering most of the features and embed options.
+Standalone Bluesky posting helper for text, rich-text facets, replies, images,
+external cards, quote records, and record-with-media embeds.
 
 Bluesky posting helper adapted from Bryan Newbold's original script:
 
@@ -10,10 +11,11 @@ Bluesky posting helper adapted from Bryan Newbold's original script:
  https://bsky.app/profile/bnewbold.net
 
  Fork:
+ 
  https://github.com/CleasbyCode/cookbook/blob/main/python-bsky-post/create_bsky_post.py
  https://gist.github.com/CleasbyCode/1eb678ca1fa1975b1c1e20aeec33637e
- 
-Supports hashtags, per-image alt text, Pillow-derived aspect ratios, ATP_AUTH_HANDLE and ATP_AUTH_PASSWORD environment variables.
+
+Supports hashtags, per-image alt text, and Pillow-derived aspect ratios.
 
 Requires: requests, beautifulsoup4, pillow
     $ pip install requests beautifulsoup4 pillow
@@ -22,16 +24,25 @@ Requires: requests, beautifulsoup4, pillow
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import io
 import ipaddress
 import json
+import math
 import os
+import queue
 import re
 import socket
+import stat
 import sys
+import threading
+import time
+import unicodedata
 import warnings
 from bisect import bisect_left
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -44,24 +55,90 @@ from PIL import Image, UnidentifiedImageError
 
 
 DEFAULT_PDS_URL = "https://bsky.social"
+DEFAULT_RECORD_SERVICE_URL = "https://public.api.bsky.app"
 MAX_IMAGES_PER_POST = 4
-MAX_IMAGE_SIZE_BYTES = 1_000_000
+MAX_IMAGE_SIZE_BYTES = 2_000_000
 MAX_POST_GRAPHEMES = 300
+MAX_POST_BYTES = 3_000
+MAX_TAG_GRAPHEMES = 64
+MAX_TAG_BYTES = 640
+MAX_LANGS = 3
 MAX_EMBED_HTML_BYTES = 2_000_000
 MAX_EMBED_IMAGE_BYTES = 1_000_000
+MAX_API_RESPONSE_BYTES = 8_000_000
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_IMAGE_DIMENSION = 16_384
 MAX_EXTERNAL_TITLE_CHARS = 300
 MAX_EXTERNAL_DESCRIPTION_CHARS = 1_000
 MAX_REDIRECTS = 3
+MAX_DOWNLOAD_ADDRESS_ATTEMPTS = 4
 USER_AGENT = "bsky-post/1.1 (+https://bsky.app)"
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 
-MENTION_REGEX = re.compile(
-    rb"(?:^|\W)(@([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
+HANDLE_REGEX = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+    r"\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+    re.IGNORECASE,
 )
-URL_REGEX = re.compile(rb"(?:^|[^\w/])((?:https?://)[^\s<>'\"`]+)", re.IGNORECASE)
-HASHTAG_REGEX = re.compile(r"(?:^|\W)(#[\w\-]+)")
+MENTION_REGEX = re.compile(
+    r"(?<![\w@])"
+    r"(@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)"
+    r"(?![a-z0-9-])",
+    re.IGNORECASE,
+)
+URL_REGEX = re.compile(
+    r"(?<![\w/])((?:https?://)[^\s<>'\"`]+)",
+    re.IGNORECASE,
+)
+HASHTAG_REGEX = re.compile(r"(^|\s)([#＃])(\S+)")
+CASHTAG_REGEX = re.compile(
+    r"(^|\s|\()\$([A-Za-z][A-Za-z0-9]{0,4})"
+    r"(?=\s|$|[.,;:!?)\"'\u2019])"
+)
+DID_REGEX = re.compile(
+    r"^did:[a-z0-9]+:"
+    r"(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2})+"
+    r"(?::(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2})+)*$"
+)
+NSID_REGEX = re.compile(
+    r"^[a-zA-Z](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+"
+    r"\.[a-zA-Z][a-zA-Z0-9]{0,62}$"
+)
+RECORD_KEY_REGEX = re.compile(r"^[A-Za-z0-9._:~-]{1,512}$")
+INVALID_PERCENT_ESCAPE_REGEX = re.compile(r"%(?![0-9A-Fa-f]{2})")
+GRANDFATHERED_LANGUAGE_TAGS = frozenset(
+    {
+        "art-lojban",
+        "cel-gaulish",
+        "en-gb-oed",
+        "i-ami",
+        "i-bnn",
+        "i-default",
+        "i-enochian",
+        "i-hak",
+        "i-klingon",
+        "i-lux",
+        "i-mingo",
+        "i-navajo",
+        "i-pwn",
+        "i-tao",
+        "i-tay",
+        "i-tsu",
+        "no-bok",
+        "no-nyn",
+        "sgn-be-fr",
+        "sgn-be-nl",
+        "sgn-ch-de",
+        "zh-guoyu",
+        "zh-hakka",
+        "zh-min",
+        "zh-min-nan",
+        "zh-xiang",
+    }
+)
 TRAILING_URL_PUNCTUATION = b".,;:!?"
 URL_CLOSING_TO_OPENING = {
     ord(")"): ord("("),
@@ -97,46 +174,248 @@ EMBED_SOURCE_ATTRS = ("image", "embed_url", "embed_ref")
 
 _SESSION = requests.Session()
 _SESSION.headers["User-Agent"] = USER_AGENT
+_SESSION.headers["Accept-Encoding"] = "identity"
 _SESSION.trust_env = False
+
+_DOWNLOAD_DEADLINE: ContextVar[Optional[float]] = ContextVar(
+    "_DOWNLOAD_DEADLINE",
+    default=None,
+)
+_NETWORK_TIMEOUT_SUBJECT: ContextVar[str] = ContextVar(
+    "_NETWORK_TIMEOUT_SUBJECT",
+    default="External download",
+)
+_IPV4_TRANSLATION_NETWORKS = (
+    ipaddress.IPv6Network("64:ff9b::/96"),
+    ipaddress.IPv6Network("::ffff:0:0:0/96"),
+)
+_DEPRECATED_6TO4_RELAY_NETWORK = ipaddress.IPv4Network("192.88.99.0/24")
+_LOCAL_IPV6_TRANSLATION_NETWORK = ipaddress.IPv6Network("64:ff9b:1::/48")
 
 
 def _api_url(pds_url: str, method: str) -> str:
     return f"{pds_url.rstrip('/')}/xrpc/{method}"
 
 
+def _url_for_log(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return "<redacted URL>"
+    if not parsed.scheme or not hostname:
+        return "<redacted URL>"
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        authority = f"{authority}:{port}"
+    suffix = "/…" if parsed.path not in ("", "/") else parsed.path
+    return f"{parsed.scheme.lower()}://{authority}{suffix}"
+
+
 def _parse_url(url: str, *, schemes: tuple[str, ...]) -> ParseResult:
-    if not url or any(ch.isspace() for ch in url):
-        raise ValueError(f"Invalid URL: {url!r}")
-    parsed = urlparse(url)
+    if (
+        not url
+        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url)
+        or INVALID_PERCENT_ESCAPE_REGEX.search(url)
+    ):
+        raise ValueError("Invalid URL")
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise ValueError("Invalid URL") from exc
     scheme = parsed.scheme.lower()
     allowed_schemes = tuple(candidate.lower() for candidate in schemes)
     if scheme not in allowed_schemes:
         joined = ", ".join(schemes)
-        raise ValueError(f"URL must use one of these schemes ({joined}): {url!r}")
+        raise ValueError(f"URL must use one of these schemes: {joined}")
     if not parsed.hostname:
-        raise ValueError(f"URL has no host: {url!r}")
+        raise ValueError("URL has no host")
     if parsed.username or parsed.password:
-        raise ValueError(f"URL must not include credentials: {url!r}")
+        raise ValueError("URL must not include credentials")
     try:
         parsed.port
     except ValueError as exc:
-        raise ValueError(f"URL has an invalid port: {url!r}") from exc
+        raise ValueError("URL has an invalid port") from exc
     return parsed
 
 
-def normalize_pds_url(pds_url: str, *, allow_insecure: bool = False) -> str:
-    parsed = _parse_url(pds_url.strip(), schemes=("http", "https"))
+def _is_loopback_hostname(hostname: str) -> bool:
+    normalized = hostname.rstrip(".").lower()
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def normalize_service_url(
+    service_url: str,
+    *,
+    service_name: str,
+    allow_insecure: bool = False,
+) -> str:
+    parsed = _parse_url(service_url.strip(), schemes=("http", "https"))
     if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
         raise ValueError(
-            "PDS URL must be only a scheme and host, without path/query/fragment"
+            f"{service_name} URL must be only a scheme and host, "
+            "without path/query/fragment"
         )
     scheme = parsed.scheme.lower()
     if scheme != "https" and not allow_insecure:
         raise ValueError(
-            "Refusing to send credentials to a non-HTTPS PDS URL "
+            f"Refusing to use a non-HTTPS {service_name} URL "
             "(use --allow-insecure-pds only for local testing)"
         )
+    if scheme != "https" and not _is_loopback_hostname(parsed.hostname or ""):
+        raise ValueError(
+            f"Insecure {service_name} URLs are limited to localhost or loopback IPs"
+        )
     return urlunparse((scheme, parsed.netloc, "", "", "", "")).rstrip("/")
+
+
+def normalize_pds_url(pds_url: str, *, allow_insecure: bool = False) -> str:
+    return normalize_service_url(
+        pds_url,
+        service_name="PDS",
+        allow_insecure=allow_insecure,
+    )
+
+
+def _remaining_download_time(deadline: float, operation: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise requests.Timeout(
+            f"{_NETWORK_TIMEOUT_SUBJECT.get()} timed out while {operation}"
+        )
+    return remaining
+
+
+def _run_before_download_deadline(
+    action: Callable[[], Any],
+    deadline: float,
+    operation: str,
+    *,
+    dispose_abandoned: Optional[Callable[[Any], None]] = None,
+) -> Any:
+    """Run one blocking operation without allowing it past the total deadline."""
+    outcome: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+    state_lock = threading.Lock()
+    abandoned = [False]
+
+    def abandon_pending_outcome() -> None:
+        late_outcome: Optional[tuple[bool, Any]] = None
+        with state_lock:
+            abandoned[0] = True
+            try:
+                late_outcome = outcome.get_nowait()
+            except queue.Empty:
+                pass
+        if (
+            late_outcome is not None
+            and late_outcome[0]
+            and dispose_abandoned is not None
+        ):
+            try:
+                dispose_abandoned(late_outcome[1])
+            except Exception:
+                pass
+
+    def worker() -> None:
+        try:
+            value = action()
+            succeeded = True
+        except Exception as exc:
+            value = exc
+            succeeded = False
+
+        should_dispose = False
+        with state_lock:
+            if abandoned[0]:
+                should_dispose = succeeded and dispose_abandoned is not None
+            else:
+                outcome.put_nowait((succeeded, value))
+        if should_dispose and dispose_abandoned is not None:
+            try:
+                dispose_abandoned(value)
+            except Exception:
+                pass
+
+    thread = threading.Thread(
+        target=worker,
+        name="bsky-download-operation",
+        daemon=True,
+    )
+    # Do not launch work when an inherited deadline has already expired.
+    _remaining_download_time(deadline, operation)
+    thread.start()
+    try:
+        succeeded, value = outcome.get(
+            timeout=_remaining_download_time(deadline, operation)
+        )
+    except requests.Timeout:
+        abandon_pending_outcome()
+        raise
+    except queue.Empty as exc:
+        abandon_pending_outcome()
+        raise requests.Timeout(
+            f"{_NETWORK_TIMEOUT_SUBJECT.get()} timed out while {operation}"
+        ) from exc
+
+    if not succeeded:
+        raise value
+    return value
+
+
+def _embedded_ipv4_addresses(
+    address: ipaddress.IPv6Address,
+) -> List[ipaddress.IPv4Address]:
+    embedded: List[ipaddress.IPv4Address] = []
+    if address.ipv4_mapped is not None:
+        embedded.append(address.ipv4_mapped)
+    if address.sixtofour is not None:
+        embedded.append(address.sixtofour)
+    if address.teredo is not None:
+        embedded.extend(address.teredo)
+    for network in _IPV4_TRANSLATION_NETWORKS:
+        if address in network:
+            translated = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+            if translated not in embedded:
+                embedded.append(translated)
+    return embedded
+
+
+def _is_public_unicast_address(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    excluded = (
+        address.is_private,
+        address.is_loopback,
+        address.is_link_local,
+        address.is_multicast,
+        address.is_reserved,
+        address.is_unspecified,
+        getattr(address, "is_site_local", False),
+    )
+    if not address.is_global or any(excluded):
+        return False
+    if (
+        isinstance(address, ipaddress.IPv4Address)
+        and address in _DEPRECATED_6TO4_RELAY_NETWORK
+    ):
+        return False
+    if (
+        isinstance(address, ipaddress.IPv6Address)
+        and address in _LOCAL_IPV6_TRANSLATION_NETWORK
+    ):
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        return all(
+            _is_public_unicast_address(embedded)
+            for embedded in _embedded_ipv4_addresses(address)
+        )
+    return True
 
 
 def _public_url_addresses(url: str) -> tuple[ParseResult, List[str]]:
@@ -147,11 +426,24 @@ def _public_url_addresses(url: str) -> tuple[ParseResult, List[str]]:
         if parsed.port is not None
         else (443 if parsed.scheme.lower() == "https" else 80)
     )
-    try:
-        infos = socket.getaddrinfo(
+
+    def resolve() -> Any:
+        return socket.getaddrinfo(
             parsed.hostname,
             port,
             type=socket.SOCK_STREAM,
+        )
+
+    try:
+        deadline = _DOWNLOAD_DEADLINE.get()
+        infos = (
+            resolve()
+            if deadline is None
+            else _run_before_download_deadline(
+                resolve,
+                deadline,
+                f"resolving {parsed.hostname!r}",
+            )
         )
     except socket.gaierror as exc:
         raise ValueError(f"Could not resolve {parsed.hostname!r}: {exc}") from exc
@@ -161,7 +453,7 @@ def _public_url_addresses(url: str) -> tuple[ParseResult, List[str]]:
         address = info[4][0]
         ip = ipaddress.ip_address(address)
         ip = getattr(ip, "ipv4_mapped", None) or ip
-        if not ip.is_global:
+        if not _is_public_unicast_address(ip):
             raise ValueError(
                 f"Refusing to fetch non-public address {ip} for host {parsed.hostname!r}"
             )
@@ -216,28 +508,56 @@ class _PinnedHTTPSAdapter(HTTPAdapter):
 @contextmanager
 def _open_pinned_response(
     url: str,
-    timeout: int,
+    timeout: float,
 ) -> Iterator[requests.Response]:
-    """Open one response using exactly one of the URL's validated addresses."""
+    """Open one response using one of a bounded set of validated addresses."""
     parsed, addresses = _public_url_addresses(url)
+    deadline = _DOWNLOAD_DEADLINE.get()
     last_error: Optional[requests.RequestException] = None
-    for address in addresses:
+    for address in addresses[:MAX_DOWNLOAD_ADDRESS_ATTEMPTS]:
         session = requests.Session()
         session.headers.update(_SESSION.headers)
+        session.headers["Accept-Encoding"] = "identity"
         session.trust_env = False
         if parsed.scheme.lower() == "https":
             session.mount("https://", _PinnedHTTPSAdapter(parsed.hostname or ""))
         try:
-            response = session.get(
-                _pinned_url(parsed, address),
-                headers={"Host": _original_authority(parsed)},
-                timeout=timeout,
-                stream=True,
-                allow_redirects=False,
+            request_timeout = (
+                timeout
+                if deadline is None
+                else _remaining_download_time(
+                    deadline,
+                    f"connecting to {_url_for_log(url)!r}",
+                )
+            )
+
+            def request() -> requests.Response:
+                return session.get(
+                    _pinned_url(parsed, address),
+                    headers={"Host": _original_authority(parsed)},
+                    timeout=request_timeout,
+                    stream=True,
+                    allow_redirects=False,
+                )
+
+            response = (
+                request()
+                if deadline is None
+                else _run_before_download_deadline(
+                    request,
+                    deadline,
+                    f"connecting to {_url_for_log(url)!r}",
+                    dispose_abandoned=lambda late_response: late_response.close(),
+                )
             )
         except requests.RequestException as exc:
             last_error = exc
             session.close()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise requests.Timeout(
+                    "External download timed out while connecting to "
+                    f"{_url_for_log(url)!r}"
+                ) from exc
             continue
 
         try:
@@ -248,8 +568,13 @@ def _open_pinned_response(
         return
 
     if last_error is not None:
-        raise last_error
-    raise ValueError(f"Could not connect to any address for {url!r}")
+        raise requests.RequestException(
+            "External download request failed for "
+            f"{_url_for_log(url)!r} ({type(last_error).__name__})"
+        ) from last_error
+    raise ValueError(
+        f"Could not connect to any address for {_url_for_log(url)!r}"
+    )
 
 
 def _declared_content_length(resp: requests.Response) -> Optional[int]:
@@ -263,54 +588,181 @@ def _declared_content_length(resp: requests.Response) -> Optional[int]:
 
 
 def _read_response_body(resp: requests.Response, max_bytes: int) -> bytes:
+    content_encoding = resp.headers.get("Content-Encoding", "").strip().lower()
+    if content_encoding not in ("", "identity"):
+        raise ValueError(
+            "Refusing compressed remote response with Content-Encoding "
+            f"{content_encoding!r}"
+        )
+
     declared = _declared_content_length(resp)
+    if declared is not None and declared < 0:
+        raise ValueError("Remote response declares a negative Content-Length")
     if declared is not None and declared > max_bytes:
         raise ValueError(
             f"Remote response declares {declared} bytes, above {max_bytes} limit"
         )
 
-    body = bytearray()
-    for chunk in resp.iter_content(DOWNLOAD_CHUNK_SIZE):
-        if not chunk:
-            continue
-        if len(body) + len(chunk) > max_bytes:
-            raise ValueError(f"Remote response exceeds {max_bytes} bytes")
-        body.extend(chunk)
-    return bytes(body)
+    def read_body() -> bytes:
+        body = bytearray()
+        for chunk in resp.iter_content(DOWNLOAD_CHUNK_SIZE):
+            if not chunk:
+                continue
+            if len(body) + len(chunk) > max_bytes:
+                raise ValueError(f"Remote response exceeds {max_bytes} bytes")
+            body.extend(chunk)
+        return bytes(body)
+
+    deadline = _DOWNLOAD_DEADLINE.get()
+    if deadline is None:
+        return read_body()
+    return _run_before_download_deadline(
+        read_body,
+        deadline,
+        "reading the response body",
+    )
 
 
 def _redirect_target(resp: requests.Response, current_url: str) -> str:
     location = resp.headers.get("Location")
     if not location:
-        raise ValueError(f"Redirect from {current_url!r} missing Location header")
+        raise ValueError(
+            f"Redirect from {_url_for_log(current_url)!r} missing Location header"
+        )
     return urljoin(current_url, location)
 
 
-def _safe_download(url: str, max_bytes: int, timeout: int = 10) -> tuple[bytes, str]:
+def _safe_download(
+    url: str,
+    max_bytes: int,
+    timeout: float = 10,
+) -> tuple[bytes, str]:
     """Fetch a URL through pinned public addresses and return its final URL."""
-    visited: set[str] = set()
-    current = url
-    for redirects_followed in range(MAX_REDIRECTS + 1):
-        if current in visited:
-            raise ValueError(f"Redirect loop detected at {current!r}")
-        visited.add(current)
-        with _open_pinned_response(current, timeout) as resp:
-            if resp.is_redirect:
-                if redirects_followed == MAX_REDIRECTS:
-                    raise ValueError(
-                        f"Too many redirects (> {MAX_REDIRECTS}) following {url!r}"
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Download timeout must be a positive finite number")
+
+    requested_deadline = time.monotonic() + timeout
+    outer_deadline = _DOWNLOAD_DEADLINE.get()
+    deadline = (
+        requested_deadline
+        if outer_deadline is None
+        else min(requested_deadline, outer_deadline)
+    )
+    deadline_token = _DOWNLOAD_DEADLINE.set(deadline)
+    subject_token = _NETWORK_TIMEOUT_SUBJECT.set("External download")
+    try:
+        visited: set[str] = set()
+        current = url
+        for redirects_followed in range(MAX_REDIRECTS + 1):
+            _remaining_download_time(
+                deadline,
+                f"fetching {_url_for_log(current)!r}",
+            )
+            if current in visited:
+                raise ValueError(
+                    f"Redirect loop detected at {_url_for_log(current)!r}"
+                )
+            visited.add(current)
+            with _open_pinned_response(current, timeout) as resp:
+                status_code = getattr(resp, "status_code", None)
+                if status_code is None:
+                    status_code = 302 if getattr(resp, "is_redirect", False) else 200
+                if 300 <= status_code < 400:
+                    if redirects_followed == MAX_REDIRECTS:
+                        raise ValueError(
+                            f"Too many redirects (> {MAX_REDIRECTS}) "
+                            f"following {_url_for_log(url)!r}"
+                        )
+                    redirect_url = _redirect_target(resp, current)
+                    current_parsed = _parse_url(
+                        current,
+                        schemes=("http", "https"),
                     )
-                current = _redirect_target(resp, current)
-                continue
-            resp.raise_for_status()
-            return _read_response_body(resp, max_bytes), current
-    raise ValueError(f"Too many redirects (> {MAX_REDIRECTS}) following {url!r}")
+                    redirect_parsed = _parse_url(
+                        redirect_url,
+                        schemes=("http", "https"),
+                    )
+                    if (
+                        current_parsed.scheme.lower() == "https"
+                        and redirect_parsed.scheme.lower() != "https"
+                    ):
+                        raise ValueError(
+                            "Refusing HTTPS-to-HTTP redirect from "
+                            f"{_url_for_log(current)!r} to "
+                            f"{_url_for_log(redirect_url)!r}"
+                        )
+                    current = redirect_url
+                    continue
+                try:
+                    resp.raise_for_status()
+                except requests.RequestException as exc:
+                    raise requests.RequestException(
+                        "External download returned HTTP "
+                        f"{status_code} for {_url_for_log(current)!r}"
+                    ) from exc
+                return _read_response_body(resp, max_bytes), current
+        raise ValueError(
+            f"Too many redirects (> {MAX_REDIRECTS}) "
+            f"following {_url_for_log(url)!r}"
+        )
+    finally:
+        _NETWORK_TIMEOUT_SUBJECT.reset(subject_token)
+        _DOWNLOAD_DEADLINE.reset(deadline_token)
+
+
+@contextmanager
+def _open_api_response(
+    request_method: Callable[..., requests.Response],
+    url: str,
+    *,
+    timeout: float,
+    operation: str,
+    **request_kwargs: Any,
+) -> Iterator[requests.Response]:
+    """Open and close one streamed API response under a wall-clock deadline."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("API timeout must be a positive finite number")
+    requested_deadline = time.monotonic() + timeout
+    outer_deadline = _DOWNLOAD_DEADLINE.get()
+    deadline = (
+        requested_deadline
+        if outer_deadline is None
+        else min(requested_deadline, outer_deadline)
+    )
+    deadline_token = _DOWNLOAD_DEADLINE.set(deadline)
+    subject_token = _NETWORK_TIMEOUT_SUBJECT.set("API request")
+    response: Optional[requests.Response] = None
+
+    def request() -> requests.Response:
+        return request_method(
+            url,
+            timeout=timeout,
+            allow_redirects=False,
+            stream=True,
+            **request_kwargs,
+        )
+
+    try:
+        response = _run_before_download_deadline(
+            request,
+            deadline,
+            operation,
+            dispose_abandoned=lambda late_response: late_response.close(),
+        )
+        yield response
+    finally:
+        try:
+            if response is not None:
+                response.close()
+        finally:
+            _NETWORK_TIMEOUT_SUBJECT.reset(subject_token)
+            _DOWNLOAD_DEADLINE.reset(deadline_token)
 
 
 def _json_object(resp: requests.Response, context: str) -> Dict[str, Any]:
     try:
-        data = resp.json()
-    except ValueError as exc:
+        data = json.loads(_read_response_body(resp, MAX_API_RESPONSE_BYTES))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{context} returned a non-JSON response") from exc
     if not isinstance(data, dict):
         raise ValueError(f"{context} returned an unexpected JSON shape")
@@ -318,17 +770,19 @@ def _json_object(resp: requests.Response, context: str) -> Dict[str, Any]:
 
 
 def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
-    resp = _SESSION.post(
+    with _open_api_response(
+        _SESSION.post,
         _api_url(pds_url, "com.atproto.server.createSession"),
-        json={"identifier": handle, "password": password},
         timeout=30,
-        allow_redirects=False,
-    )
-    if 300 <= resp.status_code < 400:
-        resp.close()
-        raise ValueError("Refusing redirect from credential-bearing createSession request")
-    resp.raise_for_status()
-    data = _json_object(resp, "createSession")
+        operation="waiting for createSession response headers",
+        json={"identifier": handle, "password": password},
+    ) as resp:
+        if 300 <= resp.status_code < 400:
+            raise ValueError(
+                "Refusing redirect from credential-bearing createSession request"
+            )
+        resp.raise_for_status()
+        data = _json_object(resp, "createSession")
     if not isinstance(data.get("accessJwt"), str) or not isinstance(data.get("did"), str):
         raise ValueError("createSession response is missing accessJwt or did")
     return data
@@ -336,24 +790,55 @@ def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
 
 def parse_spans(
     text: str,
-    regex: "re.Pattern[bytes]",
+    regex: "re.Pattern[str]",
     key: str,
-    transform: Callable[[re.Match], str] = lambda m: m.group(1).decode("UTF-8"),
+    transform: Callable[[re.Match[str]], str] = lambda m: m.group(1),
 ) -> List[Dict]:
-    text_bytes = text.encode("UTF-8")
+    byte_offsets = _byte_offsets(text)
     return [
-        {"start": m.start(1), "end": m.end(1), key: transform(m)}
-        for m in regex.finditer(text_bytes)
+        {
+            "start": byte_offsets[match.start(1)],
+            "end": byte_offsets[match.end(1)],
+            key: transform(match),
+        }
+        for match in regex.finditer(text)
     ]
 
 
+def _byte_offsets(text: str) -> List[int]:
+    offsets = [0]
+    for character in text:
+        offsets.append(offsets[-1] + len(character.encode("UTF-8")))
+    return offsets
+
+
+def _has_wordlike_prefix(text: str, start: int) -> bool:
+    if start == 0:
+        return False
+    category = unicodedata.category(text[start - 1])
+    return category[0] in ("L", "M", "N") or category in ("Pc", "Cf")
+
+
 def parse_mentions(text: str) -> List[Dict]:
-    return parse_spans(
-        text,
-        MENTION_REGEX,
-        "handle",
-        lambda m: m.group(1)[1:].decode("UTF-8"),
-    )
+    byte_offsets = _byte_offsets(text)
+    mentions: List[Dict] = []
+    for match in MENTION_REGEX.finditer(text):
+        start = match.start(1)
+        handle = match.group(1)[1:]
+        if (
+            _has_wordlike_prefix(text, start)
+            or len(handle) > 253
+            or HANDLE_REGEX.fullmatch(handle) is None
+        ):
+            continue
+        mentions.append(
+            {
+                "start": byte_offsets[start],
+                "end": byte_offsets[match.end(1)],
+                "handle": handle,
+            }
+        )
+    return mentions
 
 
 def _trim_url_match(url_bytes: bytes) -> bytes:
@@ -374,33 +859,89 @@ def _trim_url_match(url_bytes: bytes) -> bytes:
 
 
 def parse_urls(text: str) -> List[Dict]:
-    text_bytes = text.encode("UTF-8")
+    byte_offsets = _byte_offsets(text)
     spans: List[Dict] = []
-    for match in URL_REGEX.finditer(text_bytes):
-        url_bytes = _trim_url_match(match.group(1))
+    for match in URL_REGEX.finditer(text):
+        if _has_wordlike_prefix(text, match.start(1)):
+            continue
+        url_bytes = _trim_url_match(match.group(1).encode("UTF-8"))
         if not url_bytes:
             continue
-        start = match.start(1)
+        try:
+            url = url_bytes.decode("UTF-8")
+            _parse_url(url, schemes=("http", "https"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        start = byte_offsets[match.start(1)]
         end = start + len(url_bytes)
-        url = url_bytes.decode("UTF-8")
-        parsed = urlparse(url)
-        if parsed.scheme.lower() in ("http", "https") and parsed.netloc:
-            spans.append({"start": start, "end": end, "url": url})
+        spans.append({"start": start, "end": end, "url": url})
     return spans
 
 
+TAG_FORBIDDEN_CHARACTERS = frozenset(
+    "\ufe0f\u00ad\u2060\u200a\u200b\u200c\u200d\u20e2"
+)
+
+
+def _strip_tag_trailing_punctuation(tag: str) -> str:
+    while tag and unicodedata.category(tag[-1]).startswith("P"):
+        tag = tag[:-1]
+    return tag
+
+
+def _valid_tag_value(tag: str) -> bool:
+    if (
+        not tag
+        or len(tag.encode("UTF-8")) > MAX_TAG_BYTES
+        or any(character in TAG_FORBIDDEN_CHARACTERS for character in tag)
+        or any(unicodedata.category(character).startswith("C") for character in tag)
+    ):
+        return False
+    # Combining marks extend the preceding cluster. Other multi-codepoint
+    # clusters (flags, Hangul, emoji modifiers) remain deliberately overcounted,
+    # so this cannot admit a tag above the server's grapheme limit.
+    grapheme_upper_bound = sum(
+        not unicodedata.category(character).startswith("M")
+        for character in tag
+    ) + int(unicodedata.category(tag[0]).startswith("M"))
+    if grapheme_upper_bound > MAX_TAG_GRAPHEMES:
+        return False
+    return any(
+        not character.isdigit()
+        and not unicodedata.category(character).startswith("P")
+        for character in tag
+    )
+
+
 def parse_hashtags(text: str) -> List[Dict]:
-    byte_offsets = [0]
-    for character in text:
-        byte_offsets.append(byte_offsets[-1] + len(character.encode("UTF-8")))
-    return [
-        {
-            "start": byte_offsets[match.start(1)],
-            "end": byte_offsets[match.end(1)],
-            "tag": match.group(1)[1:],
-        }
-        for match in HASHTAG_REGEX.finditer(text)
-    ]
+    byte_offsets = _byte_offsets(text)
+    spans: List[Dict] = []
+    for match in HASHTAG_REGEX.finditer(text):
+        tag = _strip_tag_trailing_punctuation(match.group(3))
+        if not _valid_tag_value(tag):
+            continue
+        start_character = match.start(2)
+        end_character = start_character + len(match.group(2)) + len(tag)
+        spans.append(
+            {
+                "start": byte_offsets[start_character],
+                "end": byte_offsets[end_character],
+                "tag": tag,
+            }
+        )
+
+    for match in CASHTAG_REGEX.finditer(text):
+        ticker = match.group(2).upper()
+        start_character = match.start(2) - 1
+        end_character = match.end(2)
+        spans.append(
+            {
+                "start": byte_offsets[start_character],
+                "end": byte_offsets[end_character],
+                "tag": "$" + ticker,
+            }
+        )
+    return sorted(spans, key=lambda span: span["start"])
 
 
 def make_facet(match: Dict, feature: Dict) -> Dict:
@@ -412,21 +953,25 @@ def make_facet(match: Dict, feature: Dict) -> Dict:
 
 def _resolve_handle(pds_url: str, handle: str) -> Optional[str]:
     try:
-        resp = _SESSION.get(
+        with _open_api_response(
+            _SESSION.get,
             _api_url(pds_url, "com.atproto.identity.resolveHandle"),
-            params={"handle": handle},
             timeout=10,
-        )
-    except requests.RequestException:
-        return None
-    if resp.status_code == 400:
-        return None
-    try:
-        resp.raise_for_status()
-        data = resp.json()
+            operation="waiting for resolveHandle response headers",
+            params={"handle": handle},
+        ) as resp:
+            if resp.status_code == 400 or 300 <= resp.status_code < 400:
+                return None
+            resp.raise_for_status()
+            data = _json_object(resp, "resolveHandle")
+    except requests.Timeout:
+        # A timed-out header request can still be unwinding in its daemon
+        # worker. Abort the post instead of immediately reusing the Session.
+        raise
     except (requests.RequestException, ValueError):
         return None
-    return data.get("did") if isinstance(data, dict) else None
+    did = data.get("did") if isinstance(data, dict) else None
+    return did if isinstance(did, str) and DID_REGEX.fullmatch(did) else None
 
 
 def _span_insert_index(
@@ -462,6 +1007,7 @@ def _reserve_span(span: Dict, occupied: List[tuple[int, int]]) -> bool:
 def parse_facets(pds_url: str, text: str) -> List[Dict]:
     facets: List[Dict] = []
     occupied: List[tuple[int, int]] = []
+    resolved_handles: Dict[str, Optional[str]] = {}
     for u in parse_urls(text):
         if _reserve_span(u, occupied):
             facets.append(
@@ -473,7 +1019,10 @@ def parse_facets(pds_url: str, text: str) -> List[Dict]:
     for m in parse_mentions(text):
         if _overlaps_existing(m, occupied):
             continue
-        did = _resolve_handle(pds_url, m["handle"])
+        cache_key = m["handle"].lower()
+        if cache_key not in resolved_handles:
+            resolved_handles[cache_key] = _resolve_handle(pds_url, m["handle"])
+        did = resolved_handles[cache_key]
         if did and _reserve_span(m, occupied):
             facets.append(
                 make_facet(
@@ -493,45 +1042,146 @@ def _path_parts(parsed: ParseResult) -> tuple[str, ...]:
     return tuple(part for part in parsed.path.split("/") if part)
 
 
+def _validate_at_identifier(identifier: str) -> None:
+    if DID_REGEX.fullmatch(identifier):
+        return
+    if (
+        identifier == identifier.lower()
+        and len(identifier) <= 253
+        and HANDLE_REGEX.fullmatch(identifier)
+    ):
+        return
+    raise ValueError("AT URI authority must be a normalized DID or handle")
+
+
+def _validate_nsid(nsid: str) -> None:
+    authority, separator, _name = nsid.rpartition(".")
+    if (
+        not separator
+        or len(nsid) > 317
+        or len(authority) > 253
+        or NSID_REGEX.fullmatch(nsid) is None
+    ):
+        raise ValueError(f"Invalid NSID in AT URI: {nsid!r}")
+
+
+def _validate_record_key(record_key: str) -> None:
+    if (
+        record_key in (".", "..")
+        or RECORD_KEY_REGEX.fullmatch(record_key) is None
+    ):
+        raise ValueError(f"Invalid record key in AT URI: {record_key!r}")
+
+
 def _parse_at_uri(parsed: ParseResult, uri: str) -> Dict:
-    parts = _path_parts(parsed)
-    if parsed.query or parsed.fragment or not parsed.netloc or len(parts) != 2:
+    try:
+        uri.encode("ASCII")
+    except UnicodeEncodeError as exc:
+        raise ValueError("AT URI must contain only ASCII characters") from exc
+    if not uri.startswith("at://"):
+        raise ValueError("AT URI must use the normalized lowercase at:// scheme")
+    if len(uri.encode("ASCII")) > 8 * 1024:
+        raise ValueError("AT URI exceeds the 8 KiB limit")
+    if parsed.query or parsed.fragment or parsed.params or not parsed.netloc:
         raise ValueError(f"Invalid AT URI format: {uri}")
-    return {"repo": parsed.netloc, "collection": parts[0], "rkey": parts[1]}
+    path_parts = parsed.path.split("/")
+    if len(path_parts) != 3 or path_parts[0] or not all(path_parts[1:]):
+        raise ValueError(f"Invalid AT URI path: {uri}")
+    repo, collection, rkey = parsed.netloc, path_parts[1], path_parts[2]
+    _validate_at_identifier(repo)
+    _validate_nsid(collection)
+    _validate_record_key(rkey)
+    return {"repo": repo, "collection": collection, "rkey": rkey}
 
 
 def _parse_bsky_app_uri(parsed: ParseResult, uri: str) -> Dict:
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid Bluesky URL format: {uri}") from exc
+    if (
+        parsed.username
+        or parsed.password
+        or port is not None
+        or parsed.params
+        or "//" in parsed.path
+        or not parsed.path
+        or parsed.path.endswith("/")
+    ):
+        raise ValueError(f"Invalid Bluesky URL format: {uri}")
     parts = _path_parts(parsed)
     if len(parts) != 4 or parts[0] != "profile":
         raise ValueError(f"Invalid Bluesky URL format: {uri}")
     _, repo, collection, rkey = parts
+    mapped_collection = BSKY_APP_COLLECTIONS.get(collection)
+    if mapped_collection is None:
+        raise ValueError(f"Unsupported Bluesky record path: {collection!r}")
+    _validate_at_identifier(repo)
+    _validate_record_key(rkey)
     return {
         "repo": repo,
-        "collection": BSKY_APP_COLLECTIONS.get(collection, collection),
+        "collection": mapped_collection,
         "rkey": rkey,
     }
 
 
 def parse_uri(uri: str) -> Dict:
-    parsed = urlparse(uri)
-    if parsed.scheme == "at":
+    if (
+        not isinstance(uri, str)
+        or not uri
+        or uri != uri.strip()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in uri)
+    ):
+        raise ValueError("Invalid URI format")
+    try:
+        parsed = urlparse(uri)
+    except ValueError as exc:
+        raise ValueError(f"Invalid URI format: {uri}") from exc
+    if parsed.scheme.lower() == "at":
         return _parse_at_uri(parsed, uri)
-    if parsed.scheme == "https" and parsed.hostname == "bsky.app":
+    if parsed.scheme.lower() == "https" and parsed.hostname == "bsky.app":
         return _parse_bsky_app_uri(parsed, uri)
     raise ValueError(f"Unhandled URI format: {uri}")
 
 
-def get_record(pds_url: str, uri: str) -> Dict:
-    resp = _SESSION.get(
-        _api_url(pds_url, "com.atproto.repo.getRecord"),
-        params=parse_uri(uri),
+def get_record(record_service_url: str, uri: str) -> Dict:
+    with _open_api_response(
+        _SESSION.get,
+        _api_url(record_service_url, "com.atproto.repo.getRecord"),
         timeout=10,
-    )
-    resp.raise_for_status()
-    data = _json_object(resp, "getRecord")
+        operation="waiting for getRecord response headers",
+        params=parse_uri(uri),
+    ) as resp:
+        if 300 <= resp.status_code < 400:
+            raise ValueError("Refusing redirect from getRecord request")
+        resp.raise_for_status()
+        data = _json_object(resp, "getRecord")
     if not isinstance(data.get("uri"), str) or not isinstance(data.get("cid"), str):
         raise ValueError("getRecord response is missing uri or cid")
+    try:
+        record_ref(data)
+    except ValueError as exc:
+        raise ValueError(
+            "getRecord response contains an invalid record reference"
+        ) from exc
     return data
+
+
+def _is_valid_record_cid(cid: str) -> bool:
+    if re.fullmatch(r"b[a-z2-7]{58}", cid) is None:
+        return False
+    encoded = cid[1:].upper()
+    encoded += "=" * ((8 - len(encoded) % 8) % 8)
+    try:
+        raw_cid = base64.b32decode(encoded)
+    except binascii.Error:
+        return False
+    return (
+        len(raw_cid) == 36
+        and raw_cid[:4] == b"\x01\x71\x12\x20"
+        and "b" + base64.b32encode(raw_cid).decode("ASCII").lower().rstrip("=")
+        == cid
+    )
 
 
 def record_ref(record: Dict) -> Dict:
@@ -539,28 +1189,52 @@ def record_ref(record: Dict) -> Dict:
     cid = record.get("cid")
     if not isinstance(uri, str) or not isinstance(cid, str):
         raise ValueError("Record is missing uri or cid")
+    if not uri.startswith("at://"):
+        raise ValueError("Record URI is not a normalized AT URI")
+    parse_uri(uri)
+    if not _is_valid_record_cid(cid):
+        raise ValueError("Record CID is not a blessed DAG-CBOR SHA-256 CID")
     return {"uri": uri, "cid": cid}
 
 
-def _reply_root_ref(pds_url: str, parent_reply: Dict) -> Dict:
+def _require_post_uri(uri: str, context: str) -> None:
+    parts = parse_uri(uri)
+    if parts["collection"] != "app.bsky.feed.post":
+        raise ValueError(f"{context} must reference an app.bsky.feed.post record")
+
+
+def _require_post_record(record: Dict, context: str) -> Dict:
+    uri = record.get("uri")
+    value = record.get("value")
+    if not isinstance(uri, str):
+        raise ValueError(f"{context} is missing uri")
+    _require_post_uri(uri, context)
+    if not isinstance(value, dict) or value.get("$type") != "app.bsky.feed.post":
+        raise ValueError(f"{context} is not an app.bsky.feed.post record")
+    return value
+
+
+def _reply_root_ref(record_service_url: str, parent_reply: Dict) -> Dict:
     root_ref = parent_reply.get("root")
     if not isinstance(root_ref, dict) or not isinstance(root_ref.get("uri"), str):
         raise ValueError("Parent reply reference is missing root.uri")
+    _require_post_uri(root_ref["uri"], "Reply root")
     if isinstance(root_ref.get("cid"), str):
         return record_ref(root_ref)
-    return record_ref(get_record(pds_url, root_ref["uri"]))
+    root_record = get_record(record_service_url, root_ref["uri"])
+    _require_post_record(root_record, "Reply root")
+    return record_ref(root_record)
 
 
-def get_reply_refs(pds_url: str, parent_uri: str) -> Dict:
-    parent = get_record(pds_url, parent_uri)
-    value = parent.get("value")
-    if not isinstance(value, dict):
-        raise ValueError("Parent record response is missing value")
+def get_reply_refs(record_service_url: str, parent_uri: str) -> Dict:
+    _require_post_uri(parent_uri, "Reply parent")
+    parent = get_record(record_service_url, parent_uri)
+    value = _require_post_record(parent, "Reply parent")
     parent_reply = value.get("reply")
     if parent_reply is None:
         root = record_ref(parent)
     elif isinstance(parent_reply, dict):
-        root = _reply_root_ref(pds_url, parent_reply)
+        root = _reply_root_ref(record_service_url, parent_reply)
     else:
         raise ValueError("Parent reply reference has an unexpected shape")
     return {"root": root, "parent": record_ref(parent)}
@@ -618,17 +1292,21 @@ def upload_file(
     mimetype: Optional[str] = None,
 ) -> Dict:
     content_type = mimetype or get_mimetype(filename)
-    resp = _SESSION.post(
+    with _open_api_response(
+        _SESSION.post,
         _api_url(pds_url, "com.atproto.repo.uploadBlob"),
+        timeout=60,
+        operation="waiting for uploadBlob response headers",
         headers={
             "Content-Type": content_type,
             "Authorization": "Bearer " + access_token,
         },
         data=img_bytes,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = _json_object(resp, "uploadBlob")
+    ) as resp:
+        if 300 <= resp.status_code < 400:
+            raise ValueError("Refusing redirect from uploadBlob request")
+        resp.raise_for_status()
+        data = _json_object(resp, "uploadBlob")
     blob = data.get("blob")
     if not isinstance(blob, dict):
         raise ValueError("uploadBlob response is missing blob")
@@ -636,14 +1314,30 @@ def upload_file(
 
 
 def _read_image_file(path: Path) -> bytes:
-    if not path.is_file():
-        raise ValueError(f"Image path is not a regular file: {path}")
-    if path.stat().st_size > MAX_IMAGE_SIZE_BYTES:
-        raise ValueError(
-            f"Image file size too large. {MAX_IMAGE_SIZE_BYTES:,} bytes maximum."
-        )
-    with path.open("rb") as image_file:
-        img_bytes = image_file.read(MAX_IMAGE_SIZE_BYTES + 1)
+    flags = os.O_RDONLY
+    for flag_name in ("O_CLOEXEC", "O_NONBLOCK", "O_NOFOLLOW"):
+        flags |= getattr(os, flag_name, 0)
+    file_descriptor = -1
+    try:
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():
+            raise ValueError(f"Image path must not be a symbolic link: {path}")
+        file_descriptor = os.open(path, flags)
+        file_info = os.fstat(file_descriptor)
+        if not stat.S_ISREG(file_info.st_mode):
+            raise ValueError(f"Image path is not a regular file: {path}")
+        if file_info.st_size > MAX_IMAGE_SIZE_BYTES:
+            raise ValueError(
+                f"Image file size too large. {MAX_IMAGE_SIZE_BYTES:,} bytes maximum."
+            )
+        image_file = os.fdopen(file_descriptor, "rb")
+        file_descriptor = -1
+        with image_file:
+            img_bytes = image_file.read(MAX_IMAGE_SIZE_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"Could not read image file {path!s}: {exc}") from exc
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
     if len(img_bytes) > MAX_IMAGE_SIZE_BYTES:
         raise ValueError(
             f"Image file size too large. {MAX_IMAGE_SIZE_BYTES:,} bytes maximum."
@@ -738,8 +1432,8 @@ def _attach_external_thumb(
     img_url = _meta_content(soup, "og:image")
     if not img_url:
         return
-    img_url = _absolute_url(page_url, img_url)
     try:
+        img_url = _absolute_url(page_url, img_url)
         img_bytes, _ = _safe_download(img_url, MAX_EMBED_IMAGE_BYTES)
         image_info = inspect_image(img_bytes, img_url)
         card["thumb"] = upload_file(
@@ -749,9 +1443,9 @@ def _attach_external_thumb(
             img_bytes,
             image_info["mimetype"],
         )
-    except (requests.RequestException, ValueError) as exc:
+    except (requests.RequestException, ValueError):
         print(
-            f"warning: could not embed og:image {img_url!r}: {exc}",
+            f"warning: could not embed og:image {_url_for_log(img_url)!r}.",
             file=sys.stderr,
         )
 
@@ -764,10 +1458,10 @@ def fetch_embed_url_card(pds_url: str, access_token: str, url: str) -> Dict:
     return {"$type": "app.bsky.embed.external", "external": card}
 
 
-def get_embed_ref(pds_url: str, ref_uri: str) -> Dict:
+def get_embed_ref(record_service_url: str, ref_uri: str) -> Dict:
     return {
         "$type": "app.bsky.embed.record",
-        "record": record_ref(get_record(pds_url, ref_uri)),
+        "record": record_ref(get_record(record_service_url, ref_uri)),
     }
 
 
@@ -786,25 +1480,49 @@ def _build_post_record(args: argparse.Namespace) -> Dict:
     if args.text and (facets := parse_facets(args.pds_url, args.text)):
         post["facets"] = facets
     if args.reply_to:
-        post["reply"] = get_reply_refs(args.pds_url, args.reply_to)
+        post["reply"] = get_reply_refs(
+            args.record_service_url,
+            args.reply_to,
+        )
     return post
 
 
 def _build_embed(args: argparse.Namespace, access_token: str) -> Optional[Dict]:
+    record_embed = (
+        get_embed_ref(args.record_service_url, args.embed_ref)
+        if args.embed_ref
+        else None
+    )
+    media_embed: Optional[Dict] = None
     if args.image:
-        return upload_images(args.pds_url, access_token, args.image, args.alt_text)
-    if args.embed_url:
-        return fetch_embed_url_card(args.pds_url, access_token, args.embed_url)
-    if args.embed_ref:
-        return get_embed_ref(args.pds_url, args.embed_ref)
-    return None
+        media_embed = upload_images(
+            args.pds_url,
+            access_token,
+            args.image,
+            args.alt_text,
+        )
+    elif args.embed_url:
+        media_embed = fetch_embed_url_card(
+            args.pds_url,
+            access_token,
+            args.embed_url,
+        )
+
+    if record_embed and media_embed:
+        return {
+            "$type": "app.bsky.embed.recordWithMedia",
+            "record": record_embed,
+            "media": media_embed,
+        }
+    return record_embed or media_embed
 
 
 def _response_body(resp: requests.Response) -> Any:
+    body = _read_response_body(resp, MAX_API_RESPONSE_BYTES)
     try:
-        return resp.json()
-    except ValueError:
-        return {"raw": resp.text}
+        return json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"raw": body.decode("UTF-8", errors="replace")}
 
 
 def create_post(args: argparse.Namespace) -> None:
@@ -814,25 +1532,35 @@ def create_post(args: argparse.Namespace) -> None:
     if embed := _build_embed(args, access_token):
         post["embed"] = embed
 
-    print("Creating post:", file=sys.stderr)
-    print(json.dumps(post, indent=2), file=sys.stderr)
+    print("Creating post.", file=sys.stderr)
+    if getattr(args, "verbose", False):
+        print(json.dumps(post, indent=2), file=sys.stderr)
 
-    resp = _SESSION.post(
+    with _open_api_response(
+        _SESSION.post,
         _api_url(args.pds_url, "com.atproto.repo.createRecord"),
+        timeout=30,
+        operation="waiting for createRecord response headers",
         headers={"Authorization": "Bearer " + access_token},
         json={
             "repo": session["did"],
             "collection": "app.bsky.feed.post",
             "record": post,
         },
-        timeout=30,
-    )
-
-    resp_body = _response_body(resp)
-    if not resp.ok:
-        print("createRecord error response:", file=sys.stderr)
-        print(json.dumps(resp_body, indent=2), file=sys.stderr)
-    resp.raise_for_status()
+    ) as resp:
+        if 300 <= resp.status_code < 400:
+            raise ValueError("Refusing redirect from createRecord request")
+        resp_body = _response_body(resp)
+        if not resp.ok:
+            error_name = resp_body.get("error") if isinstance(resp_body, dict) else None
+            summary = f" ({error_name})" if isinstance(error_name, str) else ""
+            print(
+                f"createRecord failed with HTTP {resp.status_code}{summary}.",
+                file=sys.stderr,
+            )
+            if getattr(args, "verbose", False):
+                print(json.dumps(resp_body, indent=2), file=sys.stderr)
+        resp.raise_for_status()
 
     print(json.dumps(resp_body, indent=2))
 
@@ -909,8 +1637,12 @@ def test_parse_hashtags():
         {"start": 13, "end": 19, "tag": "emoji"}
     ])
     _check_equal(parse_hashtags("#123 #abc-def"), [
-        {"start": 0, "end": 4, "tag": "123"},
         {"start": 5, "end": 13, "tag": "abc-def"},
+    ])
+    _check_equal(parse_hashtags("##double ＃東京 $tsla"), [
+        {"start": 0, "end": 8, "tag": "#double"},
+        {"start": 9, "end": 18, "tag": "東京"},
+        {"start": 19, "end": 24, "tag": "$TSLA"},
     ])
     _check_equal(parse_hashtags("#café #東京 #naïve"), [
         {"start": 0, "end": 6, "tag": "café"},
@@ -1326,18 +2058,20 @@ def test_read_response_body_limits():
 def test_get_reply_refs_reuses_root_ref():
     original_get_record = globals()["get_record"]
     calls = []
+    test_cid = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
     def fake_get_record(_pds_url: str, uri: str) -> Dict:
         calls.append(uri)
         if uri == "at://did:plc:parent/app.bsky.feed.post/parent":
             return {
                 "uri": uri,
-                "cid": "parent-cid",
+                "cid": test_cid,
                 "value": {
+                    "$type": "app.bsky.feed.post",
                     "reply": {
                         "root": {
                             "uri": "at://did:plc:root/app.bsky.feed.post/root",
-                            "cid": "root-cid",
+                            "cid": test_cid,
                         }
                     }
                 },
@@ -1357,11 +2091,11 @@ def test_get_reply_refs_reuses_root_ref():
     _check_equal(refs, {
         "root": {
             "uri": "at://did:plc:root/app.bsky.feed.post/root",
-            "cid": "root-cid",
+            "cid": test_cid,
         },
         "parent": {
             "uri": "at://did:plc:parent/app.bsky.feed.post/parent",
-            "cid": "parent-cid",
+            "cid": test_cid,
         },
     })
 
@@ -1403,9 +2137,10 @@ def _validate_image_args(args: argparse.Namespace) -> None:
 
 def _validate_embed_args(args: argparse.Namespace) -> int:
     selected_sources = _selected_embed_sources(args)
-    if len(selected_sources) > 1:
+    if args.image and args.embed_url:
         raise ValueError(
-            "Use only one embed source: --image, --embed-url, or --embed-ref."
+            "Use only one media source: --image or --embed-url. "
+            "Either may be combined with --embed-ref."
         )
     if args.embed_url:
         _parse_url(args.embed_url, schemes=("http", "https"))
@@ -1415,14 +2150,118 @@ def _validate_embed_args(args: argparse.Namespace) -> int:
 
 
 def _validate_text_length(text: str) -> None:
-    # Bluesky's real cap is graphemes (plus a byte cap); Python's len() counts
-    # codepoints, so emoji clusters may over-count. Kept as a client-side sanity
-    # check; the server enforces the true limit.
-    if text and len(text) > MAX_POST_GRAPHEMES:
+    byte_length = len(text.encode("UTF-8"))
+    if byte_length > MAX_POST_BYTES:
         raise ValueError(
-            f"Post text exceeds {MAX_POST_GRAPHEMES}-codepoint client-side limit "
-            f"(got {len(text)})."
+            f"Post text exceeds the {MAX_POST_BYTES:,}-byte limit "
+            f"(got {byte_length:,} bytes)."
         )
+    # Extended grapheme segmentation is not available in Python's standard
+    # library. The PDS enforces the separate MAX_POST_GRAPHEMES schema limit.
+
+
+def _is_valid_language_tag(language_tag: str) -> bool:
+    if (
+        not isinstance(language_tag, str)
+        or not language_tag
+        or len(language_tag) > 255
+    ):
+        return False
+    normalized = language_tag.lower()
+    if normalized in GRANDFATHERED_LANGUAGE_TAGS:
+        return True
+    subtags = normalized.split("-")
+    if any(
+        not subtag
+        or len(subtag) > 8
+        or not subtag.isascii()
+        or not subtag.isalnum()
+        for subtag in subtags
+    ):
+        return False
+
+    if subtags[0] == "x":
+        return len(subtags) > 1
+
+    language = subtags[0]
+    if not language.isalpha() or not 2 <= len(language) <= 8:
+        return False
+    index = 1
+
+    if 2 <= len(language) <= 3:
+        extlang_count = 0
+        while (
+            index < len(subtags)
+            and len(subtags[index]) == 3
+            and subtags[index].isalpha()
+            and extlang_count < 3
+        ):
+            index += 1
+            extlang_count += 1
+
+    if (
+        index < len(subtags)
+        and len(subtags[index]) == 4
+        and subtags[index].isalpha()
+    ):
+        index += 1
+
+    if index < len(subtags) and (
+        (len(subtags[index]) == 2 and subtags[index].isalpha())
+        or (len(subtags[index]) == 3 and subtags[index].isdigit())
+    ):
+        index += 1
+
+    variants: set[str] = set()
+    while index < len(subtags):
+        subtag = subtags[index]
+        is_variant = (
+            5 <= len(subtag) <= 8
+            or (len(subtag) == 4 and subtag[0].isdigit())
+        )
+        if not is_variant:
+            break
+        if subtag in variants:
+            return False
+        variants.add(subtag)
+        index += 1
+
+    extension_singletons: set[str] = set()
+    while (
+        index < len(subtags)
+        and len(subtags[index]) == 1
+        and subtags[index] != "x"
+    ):
+        singleton = subtags[index]
+        if singleton in extension_singletons:
+            return False
+        extension_singletons.add(singleton)
+        index += 1
+        extension_start = index
+        while index < len(subtags) and 2 <= len(subtags[index]) <= 8:
+            index += 1
+        if index == extension_start:
+            return False
+
+    if index < len(subtags) and subtags[index] == "x":
+        index += 1
+        private_use_start = index
+        while index < len(subtags) and 1 <= len(subtags[index]) <= 8:
+            index += 1
+        if index == private_use_start:
+            return False
+
+    return index == len(subtags)
+
+
+def _validate_language_args(language_tags: Optional[List[str]]) -> None:
+    if not language_tags:
+        return
+    if len(language_tags) > MAX_LANGS:
+        raise ValueError(f"At most {MAX_LANGS} language tags may be supplied.")
+    invalid = [tag for tag in language_tags if not _is_valid_language_tag(tag)]
+    if invalid:
+        raise ValueError(f"Invalid BCP 47 language tag: {invalid[0]!r}")
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -1430,28 +2269,47 @@ def validate_args(args: argparse.Namespace) -> None:
         args.pds_url,
         allow_insecure=args.allow_insecure_pds,
     )
+    args.record_service_url = normalize_service_url(
+        getattr(args, "record_service_url", DEFAULT_RECORD_SERVICE_URL),
+        service_name="record service",
+        allow_insecure=args.allow_insecure_pds,
+    )
 
     _validate_image_args(args)
     embed_sources = _validate_embed_args(args)
+    _validate_language_args(args.lang)
 
     if not args.text and embed_sources == 0:
         raise ValueError("Post text or an embed is required.")
 
     if args.reply_to:
-        parse_uri(args.reply_to)
+        _require_post_uri(args.reply_to, "Reply target")
     _validate_text_length(args.text)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bluesky post creation example script",
+        description="Create a Bluesky post with optional facets, replies, and embeds",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Examples:\n  %(prog)s "Hello, Bluesky!"\n  %(prog)s "Check this out!" --image photo.jpg --alt-text "A photo"\n  %(prog)s "Replying to a post" --reply-to "at://did:plc:xxx/app.bsky.feed.post/yyy"',
+        epilog=(
+            'Examples:\n  %(prog)s "Hello, Bluesky!"\n'
+            '  %(prog)s "Check this out!" --image photo.jpg --alt-text "A photo"\n'
+            '  %(prog)s "Quoted with media" --embed-ref "at://did:plc:xxx/app.bsky.feed.post/yyy" --image photo.jpg\n'
+            '  %(prog)s "Replying" --reply-to "at://did:plc:xxx/app.bsky.feed.post/yyy"'
+        ),
     )
     parser.add_argument("--pds-url", default=os.environ.get("ATP_PDS_HOST", DEFAULT_PDS_URL),
                         help=f"PDS URL (default: {DEFAULT_PDS_URL} or ATP_PDS_HOST env var)")
+    parser.add_argument(
+        "--record-service-url",
+        default=os.environ.get("ATP_RECORD_SERVICE_HOST", DEFAULT_RECORD_SERVICE_URL),
+        help=(
+            "Network-wide record lookup service used for replies and quotes "
+            f"(default: {DEFAULT_RECORD_SERVICE_URL} or ATP_RECORD_SERVICE_HOST)"
+        ),
+    )
     parser.add_argument("--allow-insecure-pds", action="store_true",
-                        help="Allow non-HTTPS PDS URLs for local testing only")
+                        help="Allow HTTP service URLs on localhost/loopback only")
     parser.add_argument("--handle", default=os.environ.get("ATP_AUTH_HANDLE"),
                         help="Bluesky handle (or ATP_AUTH_HANDLE env var)")
     parser.add_argument("--password", default=None,
@@ -1463,10 +2321,19 @@ def main():
     parser.add_argument("--alt-text", action="append", metavar="TEXT",
                         help="Alt text for images (one per --image, in order)")
     parser.add_argument("--lang", action="append", metavar="CODE",
-                        help="Language code (e.g., 'en', can be specified multiple times)")
+                        help="BCP 47 language tag (e.g., 'en'; at most 3)")
     parser.add_argument("--reply-to", metavar="URI", help="URI of post to reply to")
     parser.add_argument("--embed-url", metavar="URL", help="URL to embed as a link card")
-    parser.add_argument("--embed-ref", metavar="URI", help="URI of post/record to embed (quote post)")
+    parser.add_argument(
+        "--embed-ref",
+        metavar="URI",
+        help="URI of post/record to quote; may be combined with image or link card",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print the complete pending record and API error bodies to stderr",
+    )
     parser.add_argument("--self-test", "--test", action="store_true", dest="self_test",
                         help="Run local parser/validation tests and exit")
 
@@ -1476,6 +2343,11 @@ def main():
         run_self_tests()
         print("self-tests passed")
         return
+
+    try:
+        validate_args(args)
+    except ValueError as e:
+        exit_error(f"Error: {e}")
 
     if args.password:
         print(
@@ -1492,11 +2364,6 @@ def main():
             "Set ATP_AUTH_HANDLE and ATP_AUTH_PASSWORD environment variables,",
             "or use --handle and --password arguments.",
         )
-
-    try:
-        validate_args(args)
-    except ValueError as e:
-        exit_error(f"Error: {e}")
 
     try:
         create_post(args)
