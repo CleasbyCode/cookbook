@@ -140,6 +140,20 @@ MAX_EXTERNAL_DESCRIPTION_CHARS = 1_000
 MAX_ALT_TEXT_CHARS = 2_000
 # Server-supplied error text is echoed to the terminal, so keep it short.
 MAX_ERROR_DETAIL_CHARS = 300
+# C0 controls (including CR/LF/TAB), DEL, and the C1 block. Remote text reaches
+# the terminal on several paths -- XRPC error bodies, HTTP reason phrases,
+# library exception messages -- and any of those could otherwise carry escape
+# sequences that reposition the cursor, clear the screen, or forge a prompt.
+# Printable non-ASCII is deliberately left intact so genuine localized messages
+# still read correctly.
+TERMINAL_UNSAFE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# The link-card HTML parse is CPU-bound and runs after the download deadline
+# has been released, so it needs a budget of its own. html.parser is pure
+# Python: a 4 MB page of ordinary prose parses in ~1s, but 4 MB of pathological
+# shallow markup measured ~13s, which a hostile page can choose. Real article
+# pages stay far inside this budget; exceeding it degrades the card rather than
+# failing the post.
+MAX_EMBED_PARSE_SECONDS = 5.0
 MAX_REDIRECTS = 3
 MAX_DOWNLOAD_ADDRESS_ATTEMPTS = 4
 USER_AGENT = "bsky-post/1.1 (+https://github.com/CleasbyCode/cookbook)"
@@ -244,6 +258,21 @@ DECODABLE_CONTENT_ENCODINGS = frozenset(
 )
 
 
+def _terminal_safe(text: Any) -> str:
+    """Render text that came from the network safe to print to a terminal.
+
+    Control characters become visible ``\\xNN`` escapes rather than being
+    executed by the terminal emulator. Applied at every print/raise site that
+    can carry remote content, so no individual message has to remember to.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return TERMINAL_UNSAFE_CHARACTERS.sub(
+        lambda match: f"\\x{ord(match.group()):02x}",
+        text,
+    )
+
+
 class DeadlineExceeded(requests.Timeout):
     """Raised when this script's own wall-clock deadline expires.
 
@@ -291,6 +320,8 @@ _IPV4_TRANSLATION_NETWORKS = (
 )
 _DEPRECATED_6TO4_RELAY_NETWORK = ipaddress.IPv4Network("192.88.99.0/24")
 _LOCAL_IPV6_TRANSLATION_NETWORK = ipaddress.IPv6Network("64:ff9b:1::/48")
+# RFC 6052 well-known NAT64 prefix. Disjoint from the local-use /48 above.
+_WELL_KNOWN_NAT64_NETWORK = ipaddress.IPv6Network("64:ff9b::/96")
 
 
 def _api_url(pds_url: str, method: str) -> str:
@@ -508,6 +539,21 @@ def _embedded_ipv4_addresses(
 def _is_public_unicast_address(
     address: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> bool:
+    if isinstance(address, ipaddress.IPv6Address):
+        # Local-use translation prefix: never a destination we should reach.
+        if address in _LOCAL_IPV6_TRANSLATION_NETWORK:
+            return False
+        if address in _WELL_KNOWN_NAT64_NETWORK:
+            # On a DNS64/NAT64 network every public host resolves into this
+            # prefix, and Python reports the whole /96 as is_reserved -- which
+            # would refuse every link-card and og:image fetch on IPv6-only
+            # networks. Such an address *is* its embedded IPv4, so judge it by
+            # that instead, which keeps 64:ff9b::169.254.169.254 refused. The
+            # emptiness guard is load-bearing: all(()) is True.
+            embedded = _embedded_ipv4_addresses(address)
+            return bool(embedded) and all(
+                _is_public_unicast_address(candidate) for candidate in embedded
+            )
     excluded = (
         address.is_private,
         address.is_loopback,
@@ -522,11 +568,6 @@ def _is_public_unicast_address(
     if (
         isinstance(address, ipaddress.IPv4Address)
         and address in _DEPRECATED_6TO4_RELAY_NETWORK
-    ):
-        return False
-    if (
-        isinstance(address, ipaddress.IPv6Address)
-        and address in _LOCAL_IPV6_TRANSLATION_NETWORK
     ):
         return False
     if isinstance(address, ipaddress.IPv6Address):
@@ -993,11 +1034,14 @@ def _api_error_summary(body: Any) -> str:
     error_name = _api_error_name(body)
     if error_name is None:
         return ""
+    safe_name = _terminal_safe(error_name)
     message = body.get("message") if isinstance(body, dict) else None
     if isinstance(message, str) and message.strip():
-        detail = _grapheme_safe_prefix(message.strip(), MAX_ERROR_DETAIL_CHARS)
-        return f" ({error_name}: {detail})"
-    return f" ({error_name})"
+        detail = _terminal_safe(
+            _grapheme_safe_prefix(message.strip(), MAX_ERROR_DETAIL_CHARS)
+        )
+        return f" ({safe_name}: {detail})"
+    return f" ({safe_name})"
 
 
 # Login failures are the most common thing a first-time user hits, and the raw
@@ -1172,10 +1216,13 @@ def parse_hashtags(text: str) -> List[Dict]:
         )
 
     for match in CASHTAG_REGEX.finditer(text):
-        # Unlike hashtags (whose byte span covers the leading '#' but whose tag
-        # value omits it, per the Bluesky convention), cashtags deliberately
-        # keep the leading '$' in both the span and the stored tag value, so the
-        # facet reads back as e.g. "$TSLA". This asymmetry is intentional.
+        # Two intentional asymmetries with hashtags (whose byte span covers the
+        # leading '#' but whose tag value omits it, per the Bluesky convention):
+        # cashtags keep the leading '$' in both the span and the stored value,
+        # and the ticker is upper-cased to match the official composer, so
+        # "$tsla" is stored as "$TSLA". The span still covers the text as
+        # typed -- the regex is ASCII-only, so case folding cannot change the
+        # byte length and the offsets stay exact.
         ticker = match.group(2).upper()
         start_character = match.start(2) - 1
         end_character = match.end(2)
@@ -1343,10 +1390,12 @@ def _parse_bsky_app_uri(parsed: ParseResult, uri: str) -> Dict:
         port = parsed.port
     except ValueError as exc:
         raise ValueError(f"Invalid Bluesky URL format: {uri}") from exc
+    # An explicit ":443" is the https default and appears in URLs copied out of
+    # some clients; any other port would change where the record is looked up.
     if (
         parsed.username
         or parsed.password
-        or port is not None
+        or port not in (None, 443)
         or parsed.params
         or "//" in parsed.path
         or not parsed.path
@@ -1747,7 +1796,8 @@ def _attach_external_thumb(
     def warn_and_skip_thumb(reason: Exception) -> None:
         print(
             f"warning: could not embed og:image {_url_for_log(img_url)!r} "
-            f"({type(reason).__name__}: {reason}); posting the card without it.",
+            f"({type(reason).__name__}: {_terminal_safe(reason)}); "
+            "posting the card without it.",
             file=sys.stderr,
         )
 
@@ -1775,6 +1825,37 @@ def _attach_external_thumb(
         warn_and_skip_thumb(exc)
 
 
+def _parse_embed_html(html_bytes: bytes, content_type: Optional[str]) -> BeautifulSoup:
+    """Parse link-card HTML under a wall-clock budget.
+
+    `_safe_download` releases its deadline when it returns, so without this the
+    parse is the one unbounded step in building a card. On timeout the worker is
+    abandoned (Python cannot cancel a running parse) and the caller degrades to
+    a bare card; the abandoned thread finishes on its own, bounded by
+    MAX_EMBED_HTML_BYTES, and is a daemon so it never delays exit.
+    """
+    def parse() -> BeautifulSoup:
+        # Prefer the server-declared charset; BeautifulSoup still falls back to
+        # a BOM, an in-document <meta charset>, and byte sniffing when it is
+        # absent or wrong, so a page served in a non-UTF-8 encoding is decoded
+        # correctly.
+        return BeautifulSoup(
+            html_bytes,
+            "html.parser",
+            from_encoding=_charset_from_content_type(content_type),
+        )
+
+    subject_token = _NETWORK_TIMEOUT_SUBJECT.set("Link card")
+    try:
+        return _run_before_download_deadline(
+            parse,
+            time.monotonic() + MAX_EMBED_PARSE_SECONDS,
+            "parsing the linked page",
+        )
+    finally:
+        _NETWORK_TIMEOUT_SUBJECT.reset(subject_token)
+
+
 def fetch_embed_url_card(pds_url: str, access_token: str, url: str) -> Dict:
     # A link card is a decoration on the post, so no failure reading the remote
     # page is worth discarding the user's text. Anything that goes wrong past
@@ -1786,20 +1867,13 @@ def fetch_embed_url_card(pds_url: str, access_token: str, url: str) -> Dict:
             url,
             MAX_EMBED_HTML_BYTES,
         )
-        # Prefer the server-declared charset; BeautifulSoup still falls back to
-        # a BOM, an in-document <meta charset>, and byte sniffing when it is
-        # absent or wrong, so a page served in a non-UTF-8 encoding is decoded
-        # correctly.
-        soup = BeautifulSoup(
-            html_bytes,
-            "html.parser",
-            from_encoding=_charset_from_content_type(content_type),
-        )
+        soup = _parse_embed_html(html_bytes, content_type)
         card = _external_card_metadata(url, soup)
     except (requests.RequestException, ValueError) as exc:
         print(
             f"warning: could not read {_url_for_log(url)!r} for the link card "
-            f"({type(exc).__name__}: {exc}); posting a card with the URL only.",
+            f"({type(exc).__name__}: {_terminal_safe(exc)}); "
+            "posting a card with the URL only.",
             file=sys.stderr,
         )
         return {"$type": "app.bsky.embed.external", "external": card}
@@ -1898,7 +1972,7 @@ def create_post(args: argparse.Namespace) -> None:
                 f"createRecord failed with HTTP {resp.status_code}"
                 f"{_api_error_summary(resp_body)}.",
                 file=sys.stderr,
-            )
+            )  # _api_error_summary already sanitizes the server's text
             if getattr(args, "verbose", False):
                 print(json.dumps(resp_body, indent=2), file=sys.stderr)
         resp.raise_for_status()
@@ -1907,7 +1981,10 @@ def create_post(args: argparse.Namespace) -> None:
 
 
 def exit_error(*lines: str) -> None:
-    raise SystemExit("\n".join(lines))
+    # Lines routinely interpolate exception text that originated at a remote
+    # server (an XRPC message, an HTTP reason phrase), so sanitize here rather
+    # than trusting every call site to remember.
+    raise SystemExit("\n".join(_terminal_safe(line) for line in lines))
 
 
 def _check(condition: bool, message: str = "self-test check failed") -> None:
@@ -2802,6 +2879,120 @@ def test_ascii_hostname():
         raise AssertionError("expected invalid internationalized host to fail")
 
 
+def test_terminal_safe_neutralizes_control_characters():
+    """Remote text must never reach the terminal as live escape sequences."""
+    hostile = "bad\r\n\x1b[2Jspoofed\x7f\x9b0m"
+    rendered = _terminal_safe(hostile)
+    _check(
+        not any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in rendered),
+        "control characters survived _terminal_safe",
+    )
+    _check("\\x1b" in rendered and "\\x0d" in rendered)
+    # Printable non-ASCII must survive so localized messages stay readable.
+    _check_equal(_terminal_safe("naïve ünïcode 日本語"), "naïve ünïcode 日本語")
+
+    summary = _api_error_summary(
+        {"error": "Invalid\x1b[31mRequest", "message": "no\r\n\x1b[2Jspoof"}
+    )
+    _check(
+        not any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in summary),
+        "XRPC error summary leaked control characters",
+    )
+
+    try:
+        exit_error("Error: \x1b[2Jspoofed")
+    except SystemExit as exc:
+        _check("\x1b" not in str(exc), "exit_error leaked an escape sequence")
+    else:
+        raise AssertionError("exit_error did not raise")
+
+
+def test_embed_html_parse_is_budgeted():
+    """The link-card parse runs under a deadline, not unbounded after download."""
+    calls = []
+    original = _run_before_download_deadline
+
+    def recording(action, deadline, operation, **kwargs):
+        calls.append((deadline, operation))
+        return original(action, deadline, operation, **kwargs)
+
+    globals()["_run_before_download_deadline"] = recording
+    try:
+        started = time.monotonic()
+        soup = _parse_embed_html(
+            b"<html><head><meta property='og:title' content='T'></head></html>",
+            "text/html; charset=utf-8",
+        )
+    finally:
+        globals()["_run_before_download_deadline"] = original
+
+    _check_equal(_meta_content(soup, "og:title"), "T")
+    _check_equal(len(calls), 1)
+    deadline, operation = calls[0]
+    _check_equal(operation, "parsing the linked page")
+    _check(
+        0 < deadline - started <= MAX_EMBED_PARSE_SECONDS + 1,
+        "parse deadline was not derived from MAX_EMBED_PARSE_SECONDS",
+    )
+
+
+def test_nat64_addresses_follow_their_embedded_ipv4():
+    """DNS64/NAT64 answers are judged by the IPv4 they carry, not the prefix.
+
+    Python reports all of 64:ff9b::/96 as is_reserved, so without the explicit
+    branch every host on an IPv6-only network would be refused.
+    """
+    public_nat64 = ipaddress.ip_address("64:ff9b::8.8.8.8")
+    _check(public_nat64.is_reserved, "fixture no longer exercises the is_reserved path")
+    _check(_is_public_unicast_address(public_nat64), "NAT64-wrapped public IPv4 refused")
+
+    for blocked in (
+        "64:ff9b::169.254.169.254",   # cloud metadata behind NAT64
+        "64:ff9b::127.0.0.1",         # loopback behind NAT64
+        "64:ff9b::10.0.0.1",          # RFC1918 behind NAT64
+        "64:ff9b:1::7f00:1",          # local-use translation prefix
+        "2002:a9fe:a9fe::1",          # 6to4 wrapping metadata
+        "2002:0808:0808::1",          # 6to4 stays refused (deprecated)
+    ):
+        _check(
+            not _is_public_unicast_address(ipaddress.ip_address(blocked)),
+            f"expected {blocked} to be refused",
+        )
+
+
+def test_parse_bsky_app_uri_accepts_default_port():
+    expected = {
+        "repo": "example.com",
+        "collection": "app.bsky.feed.post",
+        "rkey": "abc",
+    }
+    _check_equal(parse_uri("https://bsky.app/profile/example.com/post/abc"), expected)
+    _check_equal(
+        parse_uri("https://bsky.app:443/profile/example.com/post/abc"),
+        expected,
+    )
+    for rejected in (
+        "https://bsky.app:8443/profile/example.com/post/abc",
+        "https://bsky.app:80/profile/example.com/post/abc",
+    ):
+        try:
+            parse_uri(rejected)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected {rejected!r} to be rejected")
+
+
+def test_cashtag_span_matches_text_as_typed():
+    """The stored tag is upper-cased; the byte span still covers the raw text."""
+    text = "buy $tsla now"
+    raw = text.encode("UTF-8")
+    spans = [span for span in parse_hashtags(text) if span["tag"].startswith("$")]
+    _check_equal(len(spans), 1)
+    span = spans[0]
+    _check_equal(span["tag"], "$TSLA")
+    _check_equal(raw[span["start"]:span["end"]].decode("UTF-8"), "$tsla")
+
+
 def run_self_tests() -> None:
     for test in (
         test_parse_mentions,
@@ -2831,6 +3022,11 @@ def run_self_tests() -> None:
         test_meta_content_matches_case_insensitively,
         test_charset_from_content_type,
         test_ascii_hostname,
+        test_terminal_safe_neutralizes_control_characters,
+        test_embed_html_parse_is_budgeted,
+        test_nat64_addresses_follow_their_embedded_ipv4,
+        test_parse_bsky_app_uri_accepts_default_port,
+        test_cashtag_span_matches_text_as_typed,
     ):
         test()
 
@@ -3083,7 +3279,8 @@ def main():
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print the complete pending record and API error bodies to stderr",
+        help="Print the complete pending record, and the body of a failed "
+             "createRecord, to stderr",
     )
     parser.add_argument("--self-test", "--test", action="store_true", dest="self_test",
                         help="Run local parser/validation tests and exit")

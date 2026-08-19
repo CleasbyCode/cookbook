@@ -5,7 +5,7 @@ A guide to creating posts via the Bluesky API, including rich-text facets
 and website cards — with the safety rails a script needs when it fetches
 untrusted content from the open web.
 
-*July 23, 2026 — updated August 15, 2026*
+*July 23, 2026 — updated August 19, 2026*
 
 This post is an updated companion to the AT Protocol team's original
 [Posting via the Bluesky API](https://atproto.com/blog/create-post)
@@ -175,12 +175,16 @@ preferred trailing `Z`:
 def _created_at_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-post = {
+post: Dict = {
     "$type": "app.bsky.feed.post",
     "text": args.text,
     "createdAt": _created_at_now(),
 }
 ```
+
+Every Python excerpt in this post is copied verbatim from the script (aside
+from elided bodies marked `...`), and `verify_doc_excerpts.py` alongside it
+checks that they have not drifted apart.
 
 The finished record goes to `com.atproto.repo.createRecord`, and the response
 contains the new post's AT URI and CID.
@@ -320,9 +324,12 @@ supported:
 
 Each post can carry up to four images. Since April 2026 each image blob may
 be up to **2,000,000 bytes**, raised from the 1 MB limit that applied when the
-original blog post was written; the maximum resolution went up at the same
-time, to 4000×4000 from 2000px. The script enforces the 2 MB limit locally so
-oversized files fail fast with a clear message.
+original blog post was written; the same announcement reported a higher
+maximum resolution (4000×4000, up from 2000px). Service-side limits are not
+part of the lexicon and can change without one, so treat those figures as
+"as announced in April 2026" rather than as something this script depends on
+— it checks the byte limit, which is the one that makes an upload fail, and
+enforces it locally so oversized files fail fast with a clear message.
 
 Its own dimension caps (16,384px per side, 40 megapixels) are deliberately
 *looser* than the service's — they are local decompression-bomb guards, not a
@@ -419,8 +426,14 @@ even if you never read the rest of the code.
 
 **SSRF protection with connection pinning.** Before any external fetch, the
 hostname is resolved once, and *every* DNS answer must be a public unicast
-address — private ranges, loopback, link-local, multicast, and even IPv4
-addresses smuggled inside IPv6 translation prefixes are rejected. The
+address — private ranges, loopback, link-local and multicast are rejected,
+and an IPv4 address carried inside an IPv6 translation prefix is judged by
+the address it actually carries. So `64:ff9b::169.254.169.254` is refused as
+the cloud-metadata address it really is, while `64:ff9b::8.8.8.8` is allowed,
+which is what lets the script keep working on IPv6-only networks where DNS64
+synthesizes every answer into that prefix. The deprecated 6to4 and Teredo
+prefixes are refused outright, as is the local-use translation prefix
+`64:ff9b:1::/48`. The
 connection is then made directly to a validated IP literal, while TLS still
 authenticates the original hostname via SNI and certificate checks. Because
 the connection goes to the address that was checked, a malicious DNS server
@@ -442,6 +455,13 @@ refuse redirects entirely.
 **Deadlines everywhere, and a Session per request.** Every network operation
 runs under a wall-clock deadline that covers DNS resolution, connection, and
 body reads, so a tarpit server can't hang the script indefinitely.
+
+Parsing a link card's HTML gets a budget of its own, because it is the one
+expensive step that happens *after* the download deadline has been released.
+`html.parser` is pure Python: 4 MB of ordinary prose parses in about a second,
+but 4 MB of pathological shallow markup — which a hostile page is free to
+serve — measured closer to thirteen. A page that blows the parse budget loses
+its card and nothing else.
 
 This has a consequence worth spelling out. A blocking call that blows its
 deadline is *abandoned* in a daemon thread rather than cancelled — Python
@@ -472,8 +492,17 @@ parser still encoded are refused. A declared `Content-Length` is used as an
 early-out too, but only when no coding was applied — otherwise it describes
 the compressed body and says nothing about what the response inflates to.
 
-None of this changes what gets posted — it changes what a hostile web page
-can do to the machine running the script.
+**Nothing remote is printed raw.** Error text from the network reaches your
+terminal on several paths — an XRPC error body, an HTTP reason phrase, a
+library exception message — and a terminal will happily execute escape
+sequences hidden in any of them. A server that can clear your screen and
+redraw it can also forge a convincing prompt asking you to re-enter your app
+password. Every one of those strings is therefore rendered with control
+characters escaped to visible `\xNN` before it is printed, while printable
+non-ASCII is left intact so genuine localized messages still read correctly.
+
+None of this changes what gets posted — it changes what a hostile web page,
+or a hostile PDS, can do to the machine running the script.
 
 ## Putting It All Together
 
@@ -488,9 +517,11 @@ python3 create_bsky_post.py "Hello, @alice.test! #greetings" --verbose
 ```
 
 It also ships with a built-in test suite covering the facet parsers, URI
-validation, SSRF checks, IDN resolution, redirect handling and limits,
-response size and content-encoding limits, image file safety, login error
-reporting, and the card and thumbnail degradation paths:
+validation, SSRF checks (including NAT64-translated addresses), IDN
+resolution, redirect handling and limits, response size and content-encoding
+limits, image file safety, login error reporting, terminal-safe rendering of
+server-supplied text, the link-card parse budget, and the card and thumbnail
+degradation paths:
 
 ```bash
 python3 create_bsky_post.py --self-test

@@ -97,17 +97,32 @@ Tests
 -----
 
 The script carries its own test suite — facet parsers, URI and CID
-validation, SSRF and IDN handling, redirect limits, response size and
-content-encoding limits, image file safety, login error reporting, and the
-card/thumbnail degradation paths:
+validation, SSRF and IDN handling (including NAT64-translated addresses),
+redirect limits, response size and content-encoding limits, image file safety,
+login error reporting, terminal-safe rendering of server-supplied text, the
+link-card parse budget, and the card/thumbnail degradation paths:
 
 ```shell
 python3 create_bsky_post.py --self-test
 ```
 
-`../tests/run_bsky_tests.sh` runs that suite under both normal and optimized
-(`python3 -O`) Python, and checks that no `assert` statements have crept in
-that optimization would strip.
+`run_bsky_tests.sh`, in the `tests/` directory of the C++ source tree, runs
+that suite under both normal and optimized (`python3 -O`) Python, and checks
+that no `assert` statements have crept in that optimization would strip — an
+`assert` in a self-test would silently stop testing anything under `-O`.
+
+The companion walkthrough quotes this script directly, so a third check keeps
+the two from drifting apart:
+
+```shell
+python3 verify_doc_excerpts.py
+```
+
+It reports any line of any ```python block in
+[posting-via-the-bluesky-api.md](posting-via-the-bluesky-api.md) that no
+longer appears in `create_bsky_post.py`, and exits non-zero if any has. It
+uses only the standard library, so it runs without installing the posting
+script's requirements.
 
 What the hardening covers
 -------------------------
@@ -126,6 +141,10 @@ What the hardening covers
 * **Input validation.** AT URIs, record CIDs, handles, BCP 47 language tags
   and URLs are all checked before use; image files are read symlink-safely
   and bounded by size, dimensions and pixel count.
+* **Output safety.** Error text that came from the network — an XRPC error
+  message, an HTTP reason phrase — is printed with control characters escaped,
+  so a hostile server cannot rewrite your terminal or forge a prompt asking
+  you to re-enter your app password.
 * **Graceful degradation.** A failed thumbnail, an unreadable embed page or
   an unresolvable mention costs you that one feature, never the post.
 
