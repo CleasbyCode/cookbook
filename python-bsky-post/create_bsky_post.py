@@ -193,35 +193,13 @@ NSID_REGEX = re.compile(
 )
 RECORD_KEY_REGEX = re.compile(r"^[A-Za-z0-9._:~-]{1,512}$")
 INVALID_PERCENT_ESCAPE_REGEX = re.compile(r"%(?![0-9A-Fa-f]{2})")
+# RFC 5646 grandfathered tags: irregular forms predating the current subtag
+# grammar, so they are matched literally rather than parsed.
 GRANDFATHERED_LANGUAGE_TAGS = frozenset(
-    {
-        "art-lojban",
-        "cel-gaulish",
-        "en-gb-oed",
-        "i-ami",
-        "i-bnn",
-        "i-default",
-        "i-enochian",
-        "i-hak",
-        "i-klingon",
-        "i-lux",
-        "i-mingo",
-        "i-navajo",
-        "i-pwn",
-        "i-tao",
-        "i-tay",
-        "i-tsu",
-        "no-bok",
-        "no-nyn",
-        "sgn-be-fr",
-        "sgn-be-nl",
-        "sgn-ch-de",
-        "zh-guoyu",
-        "zh-hakka",
-        "zh-min",
-        "zh-min-nan",
-        "zh-xiang",
-    }
+    "art-lojban cel-gaulish en-gb-oed i-ami i-bnn i-default i-enochian "
+    "i-hak i-klingon i-lux i-mingo i-navajo i-pwn i-tao i-tay i-tsu "
+    "no-bok no-nyn sgn-be-fr sgn-be-nl sgn-ch-de zh-guoyu zh-hakka zh-min "
+    "zh-min-nan zh-xiang".split()
 )
 TRAILING_URL_PUNCTUATION = b".,;:!?"
 URL_CLOSING_TO_OPENING = {
@@ -324,6 +302,11 @@ _LOCAL_IPV6_TRANSLATION_NETWORK = ipaddress.IPv6Network("64:ff9b:1::/48")
 _WELL_KNOWN_NAT64_NETWORK = ipaddress.IPv6Network("64:ff9b::/96")
 
 
+def _bracketed_host(host: str) -> str:
+    """Wrap an IPv6 literal in brackets so it can sit in a URL authority."""
+    return f"[{host}]" if ":" in host else host
+
+
 def _api_url(pds_url: str, method: str) -> str:
     return f"{pds_url.rstrip('/')}/xrpc/{method}"
 
@@ -337,7 +320,7 @@ def _url_for_log(url: str) -> str:
         return "<redacted URL>"
     if not parsed.scheme or not hostname:
         return "<redacted URL>"
-    authority = f"[{hostname}]" if ":" in hostname else hostname
+    authority = _bracketed_host(hostname)
     if port is not None:
         authority = f"{authority}:{port}"
     suffix = "/…" if parsed.path not in ("", "/") else parsed.path
@@ -430,6 +413,32 @@ def _remaining_download_time(deadline: float, operation: str) -> float:
             f"{_NETWORK_TIMEOUT_SUBJECT.get()} timed out while {operation}"
         )
     return remaining
+
+
+@contextmanager
+def _network_deadline(timeout: float, *, subject: str, label: str) -> Iterator[float]:
+    """Scope one network operation to a wall-clock deadline.
+
+    An inner call never extends an outer one: the effective deadline is the
+    earlier of the two, so a link-card fetch cannot outlive the budget of the
+    operation that started it. Both context variables are restored on exit.
+    """
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{label} timeout must be a positive finite number")
+    outer_deadline = _DOWNLOAD_DEADLINE.get()
+    requested_deadline = time.monotonic() + timeout
+    deadline = (
+        requested_deadline
+        if outer_deadline is None
+        else min(requested_deadline, outer_deadline)
+    )
+    deadline_token = _DOWNLOAD_DEADLINE.set(deadline)
+    subject_token = _NETWORK_TIMEOUT_SUBJECT.set(subject)
+    try:
+        yield deadline
+    finally:
+        _NETWORK_TIMEOUT_SUBJECT.reset(subject_token)
+        _DOWNLOAD_DEADLINE.reset(deadline_token)
 
 
 def _run_before_download_deadline(
@@ -651,15 +660,13 @@ def _ascii_hostname(hostname: str) -> str:
 
 
 def _original_authority(parsed: ParseResult) -> str:
-    hostname = _ascii_hostname(parsed.hostname or "")
-    if ":" in hostname:
-        hostname = f"[{hostname}]"
+    hostname = _bracketed_host(_ascii_hostname(parsed.hostname or ""))
     return f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
 
 
 def _pinned_url(parsed: ParseResult, address: str) -> str:
     """Replace the URL authority with a previously validated IP literal."""
-    authority = f"[{address}]" if ":" in address else address
+    authority = _bracketed_host(address)
     if parsed.port is not None:
         authority = f"{authority}:{parsed.port}"
     return urlunparse(parsed._replace(netloc=authority))
@@ -861,19 +868,11 @@ def _safe_download(
     Content-Type header (or None) so callers can honour a server-declared
     charset when decoding text.
     """
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("Download timeout must be a positive finite number")
-
-    requested_deadline = time.monotonic() + timeout
-    outer_deadline = _DOWNLOAD_DEADLINE.get()
-    deadline = (
-        requested_deadline
-        if outer_deadline is None
-        else min(requested_deadline, outer_deadline)
-    )
-    deadline_token = _DOWNLOAD_DEADLINE.set(deadline)
-    subject_token = _NETWORK_TIMEOUT_SUBJECT.set("External download")
-    try:
+    with _network_deadline(
+        timeout,
+        subject="External download",
+        label="Download",
+    ) as deadline:
         visited: set[str] = set()
         current = url
         redirects_followed = 0
@@ -930,9 +929,6 @@ def _safe_download(
                     current,
                     resp.headers.get("Content-Type"),
                 )
-    finally:
-        _NETWORK_TIMEOUT_SUBJECT.reset(subject_token)
-        _DOWNLOAD_DEADLINE.reset(deadline_token)
 
 
 @contextmanager
@@ -951,57 +947,56 @@ def _open_api_response(
     a later request depends on. That is why callers are free to catch a timeout
     and keep going.
     """
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("API timeout must be a positive finite number")
-    requested_deadline = time.monotonic() + timeout
-    outer_deadline = _DOWNLOAD_DEADLINE.get()
-    deadline = (
-        requested_deadline
-        if outer_deadline is None
-        else min(requested_deadline, outer_deadline)
-    )
-    deadline_token = _DOWNLOAD_DEADLINE.set(deadline)
-    subject_token = _NETWORK_TIMEOUT_SUBJECT.set("API request")
-    session = _new_session()
-    response: Optional[requests.Response] = None
-    abandoned = False
+    with _network_deadline(timeout, subject="API request", label="API") as deadline:
+        session = _new_session()
+        response: Optional[requests.Response] = None
+        abandoned = False
 
-    def request() -> requests.Response:
-        return session.request(
-            method,
-            url,
-            timeout=timeout,
-            allow_redirects=False,
-            stream=True,
-            **request_kwargs,
-        )
-
-    try:
-        try:
-            response = _run_before_download_deadline(
-                request,
-                deadline,
-                operation,
-                dispose_abandoned=(
-                    lambda late_response: _close_quietly(late_response, session)
-                ),
+        def request() -> requests.Response:
+            return session.request(
+                method,
+                url,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+                **request_kwargs,
             )
-            yield response
-        except DeadlineExceeded:
-            # Either the request or a body read inside the caller's block was
-            # abandoned mid-flight; the daemon worker still owns `session` and
-            # `response`, so neither may be closed from here.
-            abandoned = True
-            raise
-    finally:
+
         try:
+            try:
+                response = _run_before_download_deadline(
+                    request,
+                    deadline,
+                    operation,
+                    dispose_abandoned=(
+                        lambda late_response: _close_quietly(late_response, session)
+                    ),
+                )
+                yield response
+            except DeadlineExceeded:
+                # Either the request or a body read inside the caller's block was
+                # abandoned mid-flight; the daemon worker still owns `session` and
+                # `response`, so neither may be closed from here.
+                abandoned = True
+                raise
+        finally:
+            # The context variables are restored by _network_deadline once these
+            # closes are done, preserving the original unwind order.
             if not abandoned:
                 if response is not None:
                     _close_quietly(response)
                 _close_quietly(session)
-        finally:
-            _NETWORK_TIMEOUT_SUBJECT.reset(subject_token)
-            _DOWNLOAD_DEADLINE.reset(deadline_token)
+
+
+def _reject_redirect(resp: requests.Response, context: str) -> None:
+    """Refuse a redirected API response.
+
+    API calls are issued with allow_redirects=False, so a 3xx here means the
+    server tried to send this request -- possibly carrying credentials or a
+    blob -- somewhere we never validated. None of them is ever followed.
+    """
+    if 300 <= resp.status_code < 400:
+        raise ValueError(f"Refusing redirect from {context} request")
 
 
 def _json_object(resp: requests.Response, context: str) -> Dict[str, Any]:
@@ -1069,10 +1064,7 @@ def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
         operation="waiting for createSession response headers",
         json={"identifier": handle, "password": password},
     ) as resp:
-        if 300 <= resp.status_code < 400:
-            raise ValueError(
-                "Refusing redirect from credential-bearing createSession request"
-            )
+        _reject_redirect(resp, "credential-bearing createSession")
         if not resp.ok:
             # Surface what the PDS actually said. Without this an expired app
             # password and an account needing a 2FA code look identical.
@@ -1445,8 +1437,7 @@ def get_record(record_service_url: str, uri: str) -> Dict:
         operation="waiting for getRecord response headers",
         params=parse_uri(uri),
     ) as resp:
-        if 300 <= resp.status_code < 400:
-            raise ValueError("Refusing redirect from getRecord request")
+        _reject_redirect(resp, "getRecord")
         resp.raise_for_status()
         data = _json_object(resp, "getRecord")
     if not isinstance(data.get("uri"), str) or not isinstance(data.get("cid"), str):
@@ -1590,8 +1581,7 @@ def upload_file(
         },
         data=img_bytes,
     ) as resp:
-        if 300 <= resp.status_code < 400:
-            raise ValueError("Refusing redirect from uploadBlob request")
+        _reject_redirect(resp, "uploadBlob")
         resp.raise_for_status()
         data = _json_object(resp, "uploadBlob")
     blob = data.get("blob")
@@ -1964,8 +1954,7 @@ def create_post(args: argparse.Namespace) -> None:
             "record": post,
         },
     ) as resp:
-        if 300 <= resp.status_code < 400:
-            raise ValueError("Refusing redirect from createRecord request")
+        _reject_redirect(resp, "createRecord")
         resp_body = _response_body(resp)
         if not resp.ok:
             print(
@@ -1995,6 +1984,49 @@ def _check(condition: bool, message: str = "self-test check failed") -> None:
 def _check_equal(actual: Any, expected: Any) -> None:
     if actual != expected:
         raise AssertionError(f"self-test mismatch: {actual!r} != {expected!r}")
+
+
+@contextmanager
+def _check_raises(
+    exc_type: type[BaseException],
+    message: str,
+    *,
+    contains: str = "",
+) -> Iterator[None]:
+    """Assert the wrapped block raises `exc_type`; `message` says what should fail.
+
+    `contains` additionally pins a substring of the raised message, for the
+    cases where the wrong-but-still-raised error would hide the bug.
+    """
+    try:
+        yield
+    except exc_type as exc:
+        if contains and contains not in str(exc):
+            raise AssertionError(f"{message}: {exc}") from exc
+        return
+    raise AssertionError(message)
+
+
+@contextmanager
+def _patched_globals(**replacements: Any) -> Iterator[None]:
+    """Swap module-level names for the duration of a self-test, then restore them."""
+    originals = {name: globals()[name] for name in replacements}
+    globals().update(replacements)
+    try:
+        yield
+    finally:
+        globals().update(originals)
+
+
+@contextmanager
+def _patched_attr(target: Any, name: str, replacement: Any) -> Iterator[Any]:
+    """Same, for an attribute on an imported module or class."""
+    original = getattr(target, name)
+    setattr(target, name, replacement)
+    try:
+        yield replacement
+    finally:
+        setattr(target, name, original)
 
 
 def test_parse_mentions():
@@ -2073,21 +2105,17 @@ def test_parse_hashtags():
 
 
 def test_parse_facets_skips_overlaps():
-    original_resolve = globals()["_resolve_handle"]
     calls = []
 
     def fake_resolve(_pds_url: str, handle: str) -> str:
         calls.append(handle)
         return "did:plc:test"
 
-    try:
-        globals()["_resolve_handle"] = fake_resolve
+    with _patched_globals(_resolve_handle=fake_resolve):
         facets = parse_facets(
             "https://pds.example",
             "see https://example.com/@alice.test/#topic and @bob.test #ok",
         )
-    finally:
-        globals()["_resolve_handle"] = original_resolve
 
     _check_equal(calls, ["bob.test"])
     features = [facet["features"][0]["$type"] for facet in facets]
@@ -2118,22 +2146,14 @@ def test_parse_uri():
         "collection": "app.bsky.feed.post",
         "rkey": "abc",
     })
-    try:
+    with _check_raises(ValueError, "expected non-bsky URL to fail"):
         parse_uri("https://example.com/profile/example.com/post/abc")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected non-bsky URL to fail")
 
 
 def test_normalize_pds_url():
     _check_equal(normalize_pds_url("https://bsky.social/"), "https://bsky.social")
-    try:
+    with _check_raises(ValueError, "expected insecure PDS URL to fail"):
         normalize_pds_url("http://bsky.social")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected insecure PDS URL to fail")
     _check_equal(
         normalize_pds_url("http://localhost:2583", allow_insecure=True),
         "http://localhost:2583",
@@ -2142,23 +2162,13 @@ def test_normalize_pds_url():
 
 def test_url_security_checks():
     for url in ("http://127.0.0.1/", "http://[::1]/"):
-        try:
+        with _check_raises(ValueError, f"expected local URL to fail: {url}"):
             _public_url_addresses(url)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"expected local URL to fail: {url}")
-    try:
+    with _check_raises(ValueError, "expected URL credentials to fail"):
         _parse_url("https://user:pass@example.com/", schemes=("https",))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected URL credentials to fail")
 
 
 def test_pinned_url_transport():
-    original_getaddrinfo = socket.getaddrinfo
-
     def public_getaddrinfo(host, port, **kwargs):
         _check_equal(host, "example.com")
         _check_equal(port, 443)
@@ -2180,8 +2190,7 @@ def test_pinned_url_transport():
             ),
         ]
 
-    try:
-        socket.getaddrinfo = public_getaddrinfo
+    with _patched_attr(socket, "getaddrinfo", public_getaddrinfo):
         parsed, addresses = _public_url_addresses(
             "https://example.com:443/path?q=1"
         )
@@ -2210,15 +2219,11 @@ def test_pinned_url_transport():
                 ),
             ]
 
-        socket.getaddrinfo = mixed_getaddrinfo
-        try:
+        with _patched_attr(socket, "getaddrinfo", mixed_getaddrinfo), _check_raises(
+            ValueError,
+            "expected mixed public/private DNS answers to fail",
+        ):
             _public_url_addresses("https://example.com/")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("expected mixed public/private DNS answers to fail")
-    finally:
-        socket.getaddrinfo = original_getaddrinfo
 
     ipv6 = urlparse("https://example.com/path")
     _check_equal(
@@ -2242,7 +2247,6 @@ def test_idn_host_resolves_by_its_a_label():
     IDNA2003 codec, which disagrees with the IDNA2008/UTS46 encoding used for
     SNI and assert_hostname on labels such as 'faß'.
     """
-    original_getaddrinfo = socket.getaddrinfo
     asked = []
 
     def recording_getaddrinfo(host, port, **_kwargs):
@@ -2251,11 +2255,8 @@ def test_idn_host_resolves_by_its_a_label():
             (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port)),
         ]
 
-    try:
-        socket.getaddrinfo = recording_getaddrinfo
+    with _patched_attr(socket, "getaddrinfo", recording_getaddrinfo):
         parsed, addresses = _public_url_addresses("https://faß.example/x")
-    finally:
-        socket.getaddrinfo = original_getaddrinfo
 
     _check_equal(addresses, ["8.8.8.8"])
     expected = _ascii_hostname("faß.example")
@@ -2299,8 +2300,6 @@ def test_open_pinned_response_uses_validated_ip():
             for _prefix, adapter in self.mounts:
                 adapter.close()
 
-    original_resolver = globals()["_public_url_addresses"]
-    original_session = requests.Session
     sessions = []
 
     def fake_resolver(url: str):
@@ -2312,17 +2311,14 @@ def test_open_pinned_response_uses_validated_ip():
         sessions.append(session)
         return session
 
-    try:
-        globals()["_public_url_addresses"] = fake_resolver
-        requests.Session = fake_session_factory
+    with _patched_globals(_public_url_addresses=fake_resolver), _patched_attr(
+        requests, "Session", fake_session_factory
+    ):
         with _open_pinned_response(
             "https://example.com:8443/path",
             timeout=9,
         ) as response:
             _check(not response.closed)
-    finally:
-        globals()["_public_url_addresses"] = original_resolver
-        requests.Session = original_session
 
     _check_equal(len(sessions), 1)
     session = sessions[0]
@@ -2363,7 +2359,6 @@ def test_safe_download_redirect_returns_final_url():
         def iter_content(self, _chunk_size: int):
             yield self._body
 
-    original_open = globals()["_open_pinned_response"]
     opened = []
 
     @contextmanager
@@ -2376,15 +2371,12 @@ def test_safe_download_redirect_returns_final_url():
         else:
             raise AssertionError(f"unexpected URL: {url}")
 
-    try:
-        globals()["_open_pinned_response"] = fake_open
+    with _patched_globals(_open_pinned_response=fake_open):
         body, final_url, content_type = _safe_download(
             "https://example.com/start",
             100,
             timeout=7,
         )
-    finally:
-        globals()["_open_pinned_response"] = original_open
 
     _check_equal(body, b"finished")
     _check_equal(final_url, "https://example.com/new/page")
@@ -2416,12 +2408,8 @@ class _FakeApiSession:
 @contextmanager
 def _patched_api_session(response: Any) -> Iterator[_FakeApiSession]:
     session = _FakeApiSession(response)
-    original = globals()["_new_session"]
-    try:
-        globals()["_new_session"] = lambda: session
+    with _patched_globals(_new_session=lambda: session):
         yield session
-    finally:
-        globals()["_new_session"] = original
 
 
 def test_safe_download_redirect_limit():
@@ -2443,17 +2431,12 @@ def test_safe_download_redirect_limit():
         hops.append(url)
         yield FakeResponse(f"/hop{len(hops)}")
 
-    original_open = globals()["_open_pinned_response"]
-    try:
-        globals()["_open_pinned_response"] = fake_open
-        try:
-            _safe_download("https://example.com/a", 100, timeout=7)
-        except ValueError as exc:
-            _check("Too many redirects" in str(exc), str(exc))
-        else:
-            raise AssertionError("expected an endless redirect chain to fail")
-    finally:
-        globals()["_open_pinned_response"] = original_open
+    with _patched_globals(_open_pinned_response=fake_open), _check_raises(
+        ValueError,
+        "expected an endless redirect chain to fail",
+        contains="Too many redirects",
+    ):
+        _safe_download("https://example.com/a", 100, timeout=7)
 
     # MAX_REDIRECTS hops followed, so MAX_REDIRECTS + 1 requests were made.
     _check_equal(len(hops), MAX_REDIRECTS + 1)
@@ -2473,12 +2456,8 @@ def test_login_rejects_redirects():
 
     response = FakeResponse()
     with _patched_api_session(response) as session:
-        try:
+        with _check_raises(ValueError, "expected createSession redirect to fail"):
             bsky_login_session("https://pds.example", "alice", "secret")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("expected createSession redirect to fail")
 
     _check_equal(len(session.calls), 1)
     method, url, options = session.calls[0]
@@ -2525,8 +2504,6 @@ def test_login_failure_reports_server_error():
 
 
 def test_embed_thumbnail_uses_final_page_url():
-    original_download = globals()["_safe_download"]
-    original_attach = globals()["_attach_external_thumb"]
     attached = {}
 
     def fake_download(_url: str, _max_bytes: int):
@@ -2544,17 +2521,15 @@ def test_embed_thumbnail_uses_final_page_url():
             _meta_content(soup, "og:image"),
         )
 
-    try:
-        globals()["_safe_download"] = fake_download
-        globals()["_attach_external_thumb"] = fake_attach
+    with _patched_globals(
+        _safe_download=fake_download,
+        _attach_external_thumb=fake_attach,
+    ):
         embed = fetch_embed_url_card(
             "https://pds.example",
             "token",
             "https://example.com/original",
         )
-    finally:
-        globals()["_safe_download"] = original_download
-        globals()["_attach_external_thumb"] = original_attach
 
     _check_equal(embed["external"]["uri"], "https://example.com/original")
     _check_equal(attached, {
@@ -2581,8 +2556,7 @@ def test_thumbnail_failures_are_non_fatal():
 
     def attach(card: Dict) -> None:
         # The failure paths warn on stderr; keep --self-test output clean.
-        original_stderr, sys.stderr = sys.stderr, io.StringIO()
-        try:
+        with _patched_attr(sys, "stderr", io.StringIO()):
             _attach_external_thumb(
                 card,
                 "https://pds.example",
@@ -2590,8 +2564,6 @@ def test_thumbnail_failures_are_non_fatal():
                 "https://example.com/",
                 soup,
             )
-        finally:
-            sys.stderr = original_stderr
 
     def raise_timeout(*_args, **_kwargs):
         raise DeadlineExceeded("timed out")
@@ -2633,23 +2605,18 @@ def test_thumbnail_failures_are_non_fatal():
 
 
 def test_embed_card_degrades_when_page_unreadable():
-    original_download = globals()["_safe_download"]
-
     def fail_download(*_args, **_kwargs):
         raise ValueError("Remote response exceeds 4000000 bytes")
 
-    original_stderr, sys.stderr = sys.stderr, io.StringIO()
-    try:
-        globals()["_safe_download"] = fail_download
+    with _patched_globals(_safe_download=fail_download), _patched_attr(
+        sys, "stderr", io.StringIO()
+    ) as captured_stderr:
         embed = fetch_embed_url_card(
             "https://pds.example",
             "token",
             "https://example.com/huge",
         )
-        warning = sys.stderr.getvalue()
-    finally:
-        sys.stderr = original_stderr
-        globals()["_safe_download"] = original_download
+        warning = captured_stderr.getvalue()
 
     # An unreadable page costs the card's metadata, never the whole post.
     _check_equal(embed, {
@@ -2671,12 +2638,8 @@ def test_inspect_image():
         "height": 3,
         "mimetype": "image/png",
     })
-    try:
+    with _check_raises(ValueError, "expected invalid image to fail"):
         inspect_image(b"not an image", "broken.png")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected invalid image to fail")
 
 
 def test_read_image_file_rejects_symlinks():
@@ -2691,22 +2654,22 @@ def test_read_image_file_rejects_symlinks():
             link.symlink_to(target)
         except (OSError, NotImplementedError):
             return  # No symlink support (e.g. unprivileged Windows); nothing to test.
-        try:
+        # ELOOP from O_NOFOLLOW must not surface as "Too many levels of
+        # symbolic links", which reads like a broken filesystem.
+        with _check_raises(
+            ValueError,
+            "expected a symlinked image path to be rejected",
+            contains="must not be a symbolic link",
+        ):
             _read_image_file(link)
-        except ValueError as exc:
-            # ELOOP from O_NOFOLLOW must not surface as "Too many levels of
-            # symbolic links", which reads like a broken filesystem.
-            _check("must not be a symbolic link" in str(exc), str(exc))
-        else:
-            raise AssertionError("expected a symlinked image path to be rejected")
 
         _check(root.joinpath("missing.png").exists() is False)
-        try:
+        with _check_raises(
+            ValueError,
+            "expected a missing image path to be rejected",
+            contains="Could not read image file",
+        ):
             _read_image_file(root / "missing.png")
-        except ValueError as exc:
-            _check("Could not read image file" in str(exc), str(exc))
-        else:
-            raise AssertionError("expected a missing image path to be rejected")
 
 
 def test_read_response_body_limits():
@@ -2722,18 +2685,10 @@ def test_read_response_body_limits():
         _read_response_body(FakeResponse([b"ab", b"", b"cd"]), 4),
         b"abcd",
     )
-    try:
+    with _check_raises(ValueError, "expected declared oversized response to fail"):
         _read_response_body(FakeResponse([b"abc"], " 5 "), 4)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected declared oversized response to fail")
-    try:
+    with _check_raises(ValueError, "expected streamed oversized response to fail"):
         _read_response_body(FakeResponse([b"ab", b"cde"]), 4)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected streamed oversized response to fail")
 
 
 def test_read_response_body_content_encodings():
@@ -2754,32 +2709,19 @@ def test_read_response_body_content_encodings():
     # A declared length describes the *encoded* body, so it must not be used as
     # a decoded-size bound when a coding was applied.
     _check_equal(_read_response_body(FakeResponse("gzip", "999999"), 16), b"decoded")
-    try:
+    with _check_raises(ValueError, "expected declared oversized identity body to fail"):
         _read_response_body(FakeResponse("identity", "999999"), 16)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected declared oversized identity body to fail")
 
     # The streaming cap still stops a body that inflates past the limit.
-    try:
+    with _check_raises(ValueError, "expected oversized decoded body to fail"):
         _read_response_body(FakeResponse("gzip"), 3)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected oversized decoded body to fail")
 
     # Anything urllib3 cannot unwrap would reach the parser still encoded.
-    try:
+    with _check_raises(ValueError, "expected undecodable Content-Encoding to fail"):
         _read_response_body(FakeResponse("br-unsupported"), 16)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected undecodable Content-Encoding to fail")
 
 
 def test_get_reply_refs_reuses_root_ref():
-    original_get_record = globals()["get_record"]
     calls = []
     test_cid = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -2801,14 +2743,11 @@ def test_get_reply_refs_reuses_root_ref():
             }
         raise AssertionError(f"unexpected get_record call: {uri}")
 
-    try:
-        globals()["get_record"] = fake_get_record
+    with _patched_globals(get_record=fake_get_record):
         refs = get_reply_refs(
             "https://pds.example",
             "at://did:plc:parent/app.bsky.feed.post/parent",
         )
-    finally:
-        globals()["get_record"] = original_get_record
 
     _check_equal(calls, ["at://did:plc:parent/app.bsky.feed.post/parent"])
     _check_equal(refs, {
@@ -2871,12 +2810,8 @@ def test_ascii_hostname():
     _check_equal(_ascii_hostname("my_cdn.example.com"), "my_cdn.example.com")
     _check_equal(_ascii_hostname("münchen.de"), "xn--mnchen-3ya.de")
     _check_equal(_ascii_hostname("8.8.8.8"), "8.8.8.8")
-    try:
+    with _check_raises(ValueError, "expected invalid internationalized host to fail"):
         _ascii_hostname("\u2764.example")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected invalid internationalized host to fail")
 
 
 def test_terminal_safe_neutralizes_control_characters():
@@ -2916,15 +2851,12 @@ def test_embed_html_parse_is_budgeted():
         calls.append((deadline, operation))
         return original(action, deadline, operation, **kwargs)
 
-    globals()["_run_before_download_deadline"] = recording
-    try:
+    with _patched_globals(_run_before_download_deadline=recording):
         started = time.monotonic()
         soup = _parse_embed_html(
             b"<html><head><meta property='og:title' content='T'></head></html>",
             "text/html; charset=utf-8",
         )
-    finally:
-        globals()["_run_before_download_deadline"] = original
 
     _check_equal(_meta_content(soup, "og:title"), "T")
     _check_equal(len(calls), 1)
@@ -2994,40 +2926,17 @@ def test_cashtag_span_matches_text_as_typed():
 
 
 def run_self_tests() -> None:
-    for test in (
-        test_parse_mentions,
-        test_parse_urls,
-        test_parse_hashtags,
-        test_parse_facets_skips_overlaps,
-        test_span_reservations_stay_sorted,
-        test_parse_uri,
-        test_normalize_pds_url,
-        test_url_security_checks,
-        test_pinned_url_transport,
-        test_idn_host_resolves_by_its_a_label,
-        test_open_pinned_response_uses_validated_ip,
-        test_safe_download_redirect_returns_final_url,
-        test_safe_download_redirect_limit,
-        test_login_rejects_redirects,
-        test_login_failure_reports_server_error,
-        test_embed_thumbnail_uses_final_page_url,
-        test_thumbnail_failures_are_non_fatal,
-        test_embed_card_degrades_when_page_unreadable,
-        test_inspect_image,
-        test_read_image_file_rejects_symlinks,
-        test_read_response_body_limits,
-        test_read_response_body_content_encodings,
-        test_get_reply_refs_reuses_root_ref,
-        test_trim_card_text,
-        test_meta_content_matches_case_insensitively,
-        test_charset_from_content_type,
-        test_ascii_hostname,
-        test_terminal_safe_neutralizes_control_characters,
-        test_embed_html_parse_is_budgeted,
-        test_nat64_addresses_follow_their_embedded_ipv4,
-        test_parse_bsky_app_uri_accepts_default_port,
-        test_cashtag_span_matches_text_as_typed,
-    ):
+    # Discovered rather than listed: a new test_* function is picked up by
+    # writing it, and one can never be silently dropped from a hand-kept list.
+    # Each test restores whatever it patches, so the order is irrelevant.
+    tests = [
+        value
+        for name, value in sorted(globals().items())
+        if name.startswith("test_") and callable(value)
+    ]
+    if len(tests) < 30:
+        raise AssertionError(f"self-test discovery found only {len(tests)} tests")
+    for test in tests:
         test()
 
 

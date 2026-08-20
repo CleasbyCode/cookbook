@@ -101,10 +101,7 @@ def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
         operation="waiting for createSession response headers",
         json={"identifier": handle, "password": password},
     ) as resp:
-        if 300 <= resp.status_code < 400:
-            raise ValueError(
-                "Refusing redirect from credential-bearing createSession request"
-            )
+        _reject_redirect(resp, "credential-bearing createSession")
         if not resp.ok:
             body = _response_body(resp)
             error_name = (_api_error_name(body) or "").lower()
