@@ -51,6 +51,10 @@ Security hardening over the original script:
    them; a Session per request, so a call abandoned at its deadline can
    never share connection state with a later one
 
+ * The login session is revoked (deleteSession) when the run ends, and
+   posts use a client-chosen record key so an ambiguous createRecord
+   timeout is settled by lookup rather than risking a duplicate post
+
  * Strict validation of AT URIs, record CIDs, handles, language tags,
    image files (symlink-safe reads, preflight dimensions, bounded full
    decoding with unchanged upload bytes), and URLs
@@ -98,6 +102,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import socket
 import stat
 import subprocess
@@ -108,8 +113,9 @@ import time
 import unicodedata
 import warnings
 from bisect import bisect_left
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -141,8 +147,12 @@ MAX_API_RESPONSE_BYTES = 8_000_000
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_IMAGE_DIMENSION = 16_384
 MAX_IMAGE_DECODE_SECONDS = 5.0
+# One worker validates every image in a post. Its interpreter start-up (which
+# re-imports this module's dependencies) gets its own allowance, so a slow
+# machine does not eat into the per-image decode budget.
+MAX_IMAGE_WORKER_STARTUP_SECONDS = 15.0
 MAX_IMAGE_WORKER_MEMORY_BYTES = 768 * 1024 * 1024
-MAX_IMAGE_WORKER_REPLY_BYTES = 4096
+MAX_IMAGE_WORKER_REPLY_BYTES = 16 * 1024
 MAX_IMAGE_FRAMES = 100
 MAX_IMAGE_DECODED_PIXELS = 80_000_000
 MAX_EXTERNAL_TITLE_CHARS = 300
@@ -167,6 +177,25 @@ TERMINAL_UNSAFE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # pages stay far inside this budget; exceeding it degrades the card rather than
 # failing the post.
 MAX_EMBED_PARSE_SECONDS = 5.0
+# Link-card metadata lives in <head>, so only that part of the page is parsed.
+# Pages whose head cannot be located fall back to this many leading bytes.
+MAX_EMBED_HEAD_BYTES = 1_000_000
+HTML_HEAD_END_REGEX = re.compile(rb"</head[\s>]", re.IGNORECASE)
+HTML_BODY_START_REGEX = re.compile(rb"<body[\s>/]", re.IGNORECASE)
+# A link card is only built from HTML; any other declared type (a PDF, a video)
+# is refused before its body is downloaded.
+EMBED_HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+# Mentions are resolved concurrently, and all of them share one overall budget
+# so a post full of unresolvable handles cannot stall for minutes.
+MAX_MENTION_RESOLUTION_SECONDS = 20.0
+MENTION_RESOLUTION_WORKERS = 8
+# uploadBlob's wall-clock budget grows with the blob, so a 2 MB image still
+# fits on a slow (~256 kbit/s) uplink.
+UPLOAD_BASE_TIMEOUT_SECONDS = 30.0
+UPLOAD_MIN_BYTES_PER_SECOND = 32_000
+# Record keys for new posts are client-generated TIDs, which makes a retried
+# createRecord idempotent: the same key can never produce a second post.
+TID_ALPHABET = "234567abcdefghijklmnopqrstuvwxyz"
 MAX_REDIRECTS = 3
 MAX_DOWNLOAD_ADDRESS_ATTEMPTS = 4
 USER_AGENT = "bsky-post/1.1 (+https://github.com/CleasbyCode/cookbook)"
@@ -189,7 +218,12 @@ URL_REGEX = re.compile(
     r"(?<![\w/])((?:https?://)[^\s<>'\"`]+)",
     re.IGNORECASE,
 )
-HASHTAG_REGEX = re.compile(r"(^|\s)([#＃])(\S+)")
+# Mirrors the official composer: a tag ends at whitespace or at one of the
+# invisible characters below (so "#a​b" tags "a" rather than nothing),
+# and may not start with a variation selector.
+HASHTAG_REGEX = re.compile(
+    r"(^|\s)([#＃])(?!️)([^\s­⁠ ​‌‍⃢]+)"
+)
 CASHTAG_REGEX = re.compile(
     r"(^|\s|\()\$([A-Za-z][A-Za-z0-9]{0,4})"
     r"(?=\s|$|[.,;:!?)\"'\u2019])"
@@ -674,6 +708,12 @@ def _ascii_hostname(hostname: str) -> str:
     # surface a clear error instead of a cryptic UnicodeError on bad input.
     if hostname.isascii():
         return hostname
+    # A DNS name never exceeds 253 characters. Refusing longer input before
+    # idna.encode also keeps attacker-chosen hostnames (redirect targets,
+    # og:image URLs) away from idna's slow paths on over-long input
+    # (CVE-2024-3651, CVE-2026-45409).
+    if len(hostname.rstrip(".")) > 253:
+        raise ValueError("Internationalized hostname exceeds 253 characters")
     try:
         return idna.encode(hostname, uts46=True).decode("ascii")
     except idna.IDNAError as exc:
@@ -815,10 +855,11 @@ def _declared_content_length(resp: requests.Response) -> Optional[int]:
 
 def _urllib3_has_bounded_decoding() -> bool:
     # Fail closed on older and unrecognized versions, including prereleases.
-    # Before 2.7.0, streaming decoders can allocate the expanded body before
-    # Requests yields a chunk to the caller's size check.
+    # Before 2.7.0, streaming decoders could allocate the expanded body before
+    # Requests yields a chunk to the caller's size check; before 2.8.0,
+    # chunked deflate streaming could loop forever (GHSA-gh4c-6fx4-qh6g).
     version = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", _URLLIB3_VERSION)
-    return version is not None and tuple(map(int, version.groups())) >= (2, 7, 0)
+    return version is not None and tuple(map(int, version.groups())) >= (2, 8, 0)
 
 
 def _read_response_body(resp: requests.Response, max_bytes: int) -> bytes:
@@ -834,7 +875,7 @@ def _read_response_body(resp: requests.Response, max_bytes: int) -> bytes:
     is_encoded = content_encoding not in ("", "identity")
     if is_encoded and not _urllib3_has_bounded_decoding():
         raise ValueError(
-            "Refusing compressed response: urllib3 2.7.0 or newer is required "
+            "Refusing compressed response: urllib3 2.8.0 or newer is required "
             "for bounded decompression"
         )
 
@@ -889,16 +930,25 @@ def _charset_from_content_type(content_type: Optional[str]) -> Optional[str]:
     return None
 
 
+def _media_type(content_type: Optional[str]) -> str:
+    """Return the lower-cased media type of a Content-Type header, or ''."""
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
 def _safe_download(
     url: str,
     max_bytes: int,
     timeout: float = 10,
+    *,
+    allowed_content_types: Optional[frozenset[str]] = None,
 ) -> tuple[bytes, str, Optional[str]]:
     """Fetch a URL through pinned public addresses.
 
     Returns the body, the final URL after any redirects, and the declared
     Content-Type header (or None) so callers can honour a server-declared
-    charset when decoding text.
+    charset when decoding text. With `allowed_content_types`, a response that
+    declares any other media type is refused before its body is read; one that
+    declares none is still accepted.
     """
     with _network_deadline(
         timeout,
@@ -956,6 +1006,16 @@ def _safe_download(
                         "External download returned HTTP "
                         f"{status_code} for {_url_for_log(current)!r}"
                     ) from exc
+                media_type = _media_type(resp.headers.get("Content-Type"))
+                if (
+                    allowed_content_types is not None
+                    and media_type
+                    and media_type not in allowed_content_types
+                ):
+                    raise ValueError(
+                        f"Refusing {media_type!r} response from "
+                        f"{_url_for_log(current)!r}"
+                    )
                 return (
                     _read_response_body(resp, max_bytes),
                     current,
@@ -1114,6 +1174,31 @@ def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
     return data
 
 
+def bsky_logout_session(pds_url: str, refresh_token: str) -> None:
+    """Revoke the login's refresh token so it does not outlive this run.
+
+    Best effort: a failure only means the session expires on the PDS's own
+    schedule, which is exactly what happened before this call existed.
+    """
+    try:
+        with _open_api_response(
+            "POST",
+            _api_url(pds_url, "com.atproto.server.deleteSession"),
+            timeout=10,
+            operation="waiting for deleteSession response headers",
+            headers={"Authorization": "Bearer " + refresh_token},
+        ) as resp:
+            _reject_redirect(resp, "credential-bearing deleteSession")
+            resp.raise_for_status()
+    except (requests.RequestException, ValueError) as exc:
+        print(
+            "warning: could not end the login session "
+            f"({type(exc).__name__}: {_terminal_safe(exc)}); "
+            "it will expire on its own.",
+            file=sys.stderr,
+        )
+
+
 def _byte_offsets(text: str) -> List[int]:
     offsets = [0]
     for character in text:
@@ -1187,8 +1272,11 @@ def parse_urls(text: str) -> List[Dict]:
     return spans
 
 
+# HASHTAG_REGEX already ends a tag at these; the check below keeps direct
+# callers of _valid_tag_value to the same rule. U+FE0F is only refused as the
+# first character, matching the official composer ("#\u2764\ufe0flove" stays a tag).
 TAG_FORBIDDEN_CHARACTERS = frozenset(
-    "\ufe0f\u00ad\u2060\u200a\u200b\u200c\u200d\u20e2"
+    "\u00ad\u2060\u200a\u200b\u200c\u200d\u20e2"
 )
 
 
@@ -1201,6 +1289,7 @@ def _strip_tag_trailing_punctuation(tag: str) -> str:
 def _valid_tag_value(tag: str) -> bool:
     if (
         not tag
+        or tag[0] == "️"
         or len(tag.encode("UTF-8")) > MAX_TAG_BYTES
         or any(character in TAG_FORBIDDEN_CHARACTERS for character in tag)
         or any(
@@ -1220,8 +1309,10 @@ def _valid_tag_value(tag: str) -> bool:
     ) + int(unicodedata.category(tag[0]) in ("Mn", "Me"))
     if grapheme_upper_bound > MAX_TAG_GRAPHEMES:
         return False
+    # Only ASCII 0-9 count as digits here, as in the official composer's regex:
+    # str.isdigit() would also reject tags such as "#²".
     return any(
-        not character.isdigit()
+        not "0" <= character <= "9"
         and not unicodedata.category(character).startswith("P")
         for character in tag
     )
@@ -1324,10 +1415,35 @@ def _reserve_span(span: Dict, occupied: List[tuple[int, int]]) -> bool:
     return True
 
 
+def _resolve_handles(pds_url: str, handles: List[str]) -> Dict[str, Optional[str]]:
+    """Resolve distinct handles concurrently under one overall deadline.
+
+    Each task runs in a copy of the caller's context, so every lookup inherits
+    the shared deadline; _network_deadline never lets an inner call outlive
+    it. Once it passes, lookups still pending fail fast and resolve to None.
+    """
+    if not handles:
+        return {}
+    with _network_deadline(
+        MAX_MENTION_RESOLUTION_SECONDS,
+        subject="Mention resolution",
+        label="Mention resolution",
+    ), ThreadPoolExecutor(
+        max_workers=min(MENTION_RESOLUTION_WORKERS, len(handles)),
+        thread_name_prefix="bsky-resolve-handle",
+    ) as executor:
+        futures = {
+            handle: executor.submit(
+                copy_context().run, _resolve_handle, pds_url, handle
+            )
+            for handle in handles
+        }
+    return {handle: future.result() for handle, future in futures.items()}
+
+
 def parse_facets(pds_url: str, text: str) -> List[Dict]:
     facets: List[Dict] = []
     occupied: List[tuple[int, int]] = []
-    resolved_handles: Dict[str, Optional[str]] = {}
     for u in parse_urls(text):
         if _reserve_span(u, occupied):
             facets.append(
@@ -1336,13 +1452,25 @@ def parse_facets(pds_url: str, text: str) -> List[Dict]:
                     {"$type": "app.bsky.richtext.facet#link", "uri": u["url"]},
                 )
             )
-    for m in parse_mentions(text):
-        if _overlaps_existing(m, occupied):
-            continue
-        cache_key = m["handle"].lower()
-        if cache_key not in resolved_handles:
-            resolved_handles[cache_key] = _resolve_handle(pds_url, m["handle"])
-        did = resolved_handles[cache_key]
+    # Handles are case-insensitive, so each distinct one is looked up once.
+    mentions = [m for m in parse_mentions(text) if not _overlaps_existing(m, occupied)]
+    resolved_handles = _resolve_handles(
+        pds_url,
+        list(dict.fromkeys(m["handle"].lower() for m in mentions)),
+    )
+    unresolved = [
+        handle for handle, did in resolved_handles.items() if did is None
+    ]
+    if unresolved:
+        shown = ", ".join(f"@{handle}" for handle in unresolved[:5])
+        more = f" and {len(unresolved) - 5} more" if len(unresolved) > 5 else ""
+        print(
+            f"warning: could not resolve {shown}{more}; "
+            "posting as plain text without a mention link.",
+            file=sys.stderr,
+        )
+    for m in mentions:
+        did = resolved_handles[m["handle"].lower()]
         if did and _reserve_span(m, occupied):
             facets.append(
                 make_facet(
@@ -1435,6 +1563,10 @@ def _parse_bsky_app_uri(parsed: ParseResult, uri: str) -> Dict:
     if len(parts) != 4 or parts[0] != "profile":
         raise ValueError(f"Invalid Bluesky URL format: {uri}")
     _, repo, collection, rkey = parts
+    # Handles are case-insensitive and links copied by hand may be mixed-case;
+    # DIDs are case-sensitive and must be left exactly as written.
+    if not repo.startswith("did:"):
+        repo = repo.lower()
     mapped_collection = BSKY_APP_COLLECTIONS.get(collection)
     if mapped_collection is None:
         raise ValueError(f"Unsupported Bluesky record path: {collection!r}")
@@ -1466,13 +1598,33 @@ def parse_uri(uri: str) -> Dict:
     raise ValueError(f"Unhandled URI format: {uri}")
 
 
+def _check_record_matches_request(requested: Dict, returned_uri: str) -> None:
+    """Refuse a getRecord answer that names a different record than was asked.
+
+    A handle-addressed request is answered with the account's DID, which cannot
+    be compared without a separate resolution, so the repo is only compared
+    when the request itself named a DID.
+    """
+    returned = parse_uri(returned_uri)
+    if (
+        returned["collection"] != requested["collection"]
+        or returned["rkey"] != requested["rkey"]
+        or (
+            requested["repo"].startswith("did:")
+            and returned["repo"] != requested["repo"]
+        )
+    ):
+        raise ValueError("getRecord returned a different record than was requested")
+
+
 def get_record(record_service_url: str, uri: str) -> Dict:
+    requested = parse_uri(uri)
     with _open_api_response(
         "GET",
         _api_url(record_service_url, "com.atproto.repo.getRecord"),
         timeout=10,
         operation="waiting for getRecord response headers",
-        params=parse_uri(uri),
+        params=requested,
     ) as resp:
         _reject_redirect(resp, "getRecord")
         resp.raise_for_status()
@@ -1485,6 +1637,7 @@ def get_record(record_service_url: str, uri: str) -> Dict:
         raise ValueError(
             "getRecord response contains an invalid record reference"
         ) from exc
+    _check_record_matches_request(requested, data["uri"])
     return data
 
 
@@ -1667,14 +1820,53 @@ def _inspect_image_decoded(img_bytes: bytes) -> Dict[str, Any]:
     return {"width": width, "height": height, "mimetype": IMAGE_FORMAT_MIMETYPES[image_format]}
 
 
+# Each image in a worker batch is framed by a 4-byte big-endian length.
+_MAX_IMAGE_BATCH_BYTES = MAX_IMAGES_PER_POST * (4 + MAX_IMAGE_SIZE_BYTES)
+
+
+def _encode_image_batch(images: List[bytes]) -> bytes:
+    return b"".join(len(image).to_bytes(4, "big") + image for image in images)
+
+
+def _decode_image_batch(payload: bytes) -> List[bytes]:
+    images: List[bytes] = []
+    position = 0
+    while position < len(payload):
+        if len(images) >= MAX_IMAGES_PER_POST or len(payload) - position < 4:
+            raise ValueError("Malformed image batch")
+        size = int.from_bytes(payload[position:position + 4], "big")
+        position += 4
+        if size > MAX_IMAGE_SIZE_BYTES or len(payload) - position < size:
+            raise ValueError("Malformed image batch")
+        images.append(payload[position:position + size])
+        position += size
+    if not images:
+        raise ValueError("Empty image batch")
+    return images
+
+
+def _worker_error_text(exc: Exception) -> str:
+    # Keep even malformed metadata errors within the bounded reply file.
+    return f"{type(exc).__name__}: {str(exc)[:300]}"
+
+
 def _image_worker_main() -> None:
     try:
-        img_bytes = sys.stdin.buffer.read(MAX_IMAGE_SIZE_BYTES + 1)
-        result = {"image": _inspect_image_decoded(img_bytes)}
+        payload = sys.stdin.buffer.read(_MAX_IMAGE_BATCH_BYTES + 1)
+        if len(payload) > _MAX_IMAGE_BATCH_BYTES:
+            raise ValueError("Image batch is too large")
+        results: List[Dict[str, Any]] = []
+        # Validation stops at the first bad image: the whole post fails anyway.
+        for img_bytes in _decode_image_batch(payload):
+            try:
+                results.append({"image": _inspect_image_decoded(img_bytes)})
+            except Exception as exc:
+                results.append({"error": _worker_error_text(exc)})
+                break
+        reply: Dict[str, Any] = {"results": results}
     except Exception as exc:
-        # Keep even malformed metadata errors within the bounded reply file.
-        result = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-    sys.stdout.buffer.write(json.dumps(result, ensure_ascii=True).encode("ascii"))
+        reply = {"error": _worker_error_text(exc)}
+    sys.stdout.buffer.write(json.dumps(reply, ensure_ascii=True).encode("ascii"))
 
 
 _IMAGE_WORKER_LAUNCHER = """\
@@ -1698,7 +1890,24 @@ runpy.run_path(sys.argv[1], run_name="bsky_image_worker")["_image_worker_main"](
 """
 
 
-def _inspect_image_in_worker(img_bytes: bytes) -> Dict[str, Any]:
+def _validated_worker_image(info: Any) -> Dict[str, Any]:
+    if not isinstance(info, dict) or type(info.get("width")) is not int or type(info.get("height")) is not int:
+        raise ValueError("Image decoder returned invalid dimensions")
+    _validate_image_dimensions(info["width"], info["height"])
+    if info.get("mimetype") not in IMAGE_FORMAT_MIMETYPES.values():
+        raise ValueError("Image decoder returned an invalid MIME type")
+    return info
+
+
+def _inspect_images_in_worker(images: List[bytes]) -> List[Dict[str, Any]]:
+    """Decode a whole batch in one bounded process.
+
+    Returns one entry per image up to and including the first failure, each
+    either {"image": info} or {"error": message}. One process per post pays
+    the interpreter start-up once, and that start-up has its own allowance
+    rather than consuming the per-image decode budget.
+    """
+    budget = MAX_IMAGE_WORKER_STARTUP_SECONDS + MAX_IMAGE_DECODE_SECONDS * len(images)
     # Isolate Python startup from the caller's working directory, environment,
     # and site hooks. Restore the parent's explicit import directories only
     # after limits are installed, so pip --user and virtualenv installs work
@@ -1711,7 +1920,7 @@ def _inspect_image_in_worker(img_bytes: bytes) -> Dict[str, Any]:
     command = [
         sys.executable, "-I", "-S", "-B", "-c", _IMAGE_WORKER_LAUNCHER,
         str(Path(__file__).resolve()), str(MAX_IMAGE_WORKER_MEMORY_BYTES),
-        str(math.ceil(MAX_IMAGE_DECODE_SECONDS)), str(MAX_IMAGE_WORKER_REPLY_BYTES),
+        str(max(1, math.ceil(budget))), str(MAX_IMAGE_WORKER_REPLY_BYTES),
         json.dumps(import_paths),
     ]
     # The child needs Python's installation settings, not posting credentials
@@ -1727,8 +1936,8 @@ def _inspect_image_in_worker(img_bytes: bytes) -> Dict[str, Any]:
     with tempfile.TemporaryFile() as reply:
         try:
             completed = subprocess.run(
-                command, input=img_bytes, stdout=reply, stderr=subprocess.DEVNULL,
-                env=environment, timeout=MAX_IMAGE_DECODE_SECONDS, check=False,
+                command, input=_encode_image_batch(images), stdout=reply,
+                stderr=subprocess.DEVNULL, env=environment, timeout=budget, check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise ValueError("Image validation exceeded its time limit") from exc
@@ -1748,22 +1957,52 @@ def _inspect_image_in_worker(img_bytes: bytes) -> Dict[str, Any]:
         raise ValueError("Image decoder returned an invalid result")
     if isinstance(result.get("error"), str):
         raise ValueError(result["error"])
-    info = result.get("image")
-    if not isinstance(info, dict) or type(info.get("width")) is not int or type(info.get("height")) is not int:
-        raise ValueError("Image decoder returned invalid dimensions")
-    _validate_image_dimensions(info["width"], info["height"])
-    if info.get("mimetype") not in IMAGE_FORMAT_MIMETYPES.values():
-        raise ValueError("Image decoder returned an invalid MIME type")
-    return info
+    entries = result.get("results")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= len(images):
+        raise ValueError("Image decoder returned an invalid result")
+    validated: List[Dict[str, Any]] = []
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("error"), str):
+            validated.append({"error": entry["error"]})
+            return validated
+        validated.append({"image": _validated_worker_image(
+            entry.get("image") if isinstance(entry, dict) else None
+        )})
+    if len(validated) != len(images):
+        raise ValueError("Image decoder returned an incomplete result")
+    return validated
+
+
+def inspect_images(images: List[tuple[bytes, str]]) -> List[Dict[str, Any]]:
+    """Validate (bytes, source) pairs; the sources only label errors."""
+    if not images:
+        return []
+    for img_bytes, source in images:
+        try:
+            # This check runs before even starting a native decoder process.
+            _preflight_image(img_bytes)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Invalid image {source!r}: {exc}") from exc
+    try:
+        results = _inspect_images_in_worker([img_bytes for img_bytes, _ in images])
+    except (OSError, ValueError) as exc:
+        noun = "image" if len(images) == 1 else "images"
+        sources = ", ".join(repr(source) for _, source in images)
+        raise ValueError(f"Invalid {noun} {sources}: {exc}") from exc
+    infos: List[Dict[str, Any]] = []
+    for (_, source), result in zip(images, results):
+        if "error" in result:
+            raise ValueError(f"Invalid image {source!r}: {result['error']}")
+        infos.append(result["image"])
+    return infos
 
 
 def inspect_image(img_bytes: bytes, source: str) -> Dict[str, Any]:
-    try:
-        # This check runs before even starting a native decoder process.
-        _preflight_image(img_bytes)
-        return _inspect_image_in_worker(img_bytes)
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"Invalid image {source!r}: {exc}") from exc
+    return inspect_images([(img_bytes, source)])[0]
+
+
+def _upload_timeout(size: int) -> float:
+    return UPLOAD_BASE_TIMEOUT_SECONDS + size / UPLOAD_MIN_BYTES_PER_SECOND
 
 
 def upload_file(
@@ -1778,7 +2017,7 @@ def upload_file(
     with _open_api_response(
         "POST",
         _api_url(pds_url, "com.atproto.repo.uploadBlob"),
-        timeout=60,
+        timeout=_upload_timeout(len(img_bytes)),
         operation="waiting for uploadBlob response headers",
         headers={
             "Content-Type": mimetype,
@@ -1863,25 +2102,33 @@ def _image_embed_item(blob: Dict, image_info: Dict[str, Any], alt: str) -> Dict:
     }
 
 
+# (unchanged upload bytes, validated image info, alt text)
+PreparedImage = tuple[bytes, Dict[str, Any], str]
+
+
+def prepare_images(
+    image_paths: List[str],
+    alt_texts: Optional[List[str]] = None,
+) -> List[PreparedImage]:
+    """Read and validate every image locally, in one bounded worker.
+
+    main() runs this before logging in, so a missing or malformed file fails
+    before any network request is made or any blob is written.
+    """
+    images = [(_read_image_file(Path(path)), path) for path in image_paths]
+    infos = inspect_images(images)
+    return [
+        (img_bytes, info, _image_alt_text(alt_texts, index))
+        for index, ((img_bytes, _), info) in enumerate(zip(images, infos))
+    ]
+
+
 def upload_images(
     pds_url: str,
     access_token: str,
-    image_paths: List[str],
-    alt_texts: Optional[List[str]] = None,
+    prepared: List[PreparedImage],
 ) -> Dict:
-    # Read and validate the whole batch before uploading any of it, so an
-    # unreadable or malformed file fails before the first blob is written. Blobs
-    # left unreferenced by a later failure are garbage collected by the PDS.
-    prepared = []
-    for index, image_path in enumerate(image_paths):
-        img_bytes = _read_image_file(Path(image_path))
-        prepared.append(
-            (
-                img_bytes,
-                inspect_image(img_bytes, image_path),
-                _image_alt_text(alt_texts, index),
-            )
-        )
+    # Blobs left unreferenced by a later failure are garbage collected by the PDS.
     images = [
         _image_embed_item(
             upload_file(pds_url, access_token, img_bytes, image_info["mimetype"]),
@@ -1948,7 +2195,9 @@ def _meta_content(soup: BeautifulSoup, property_name: str) -> str:
         attrs={"name": matches},
     )
     content = tag.get("content") if tag else None
-    return content if isinstance(content, str) else ""
+    # Stripped here so a whitespace-only og:title still falls back to <title>
+    # and an og:image padded with newlines is still a fetchable URL.
+    return content.strip() if isinstance(content, str) else ""
 
 
 def _page_title(soup: BeautifulSoup) -> str:
@@ -2036,6 +2285,19 @@ def _attach_external_thumb(
         warn_and_skip_thumb(exc)
 
 
+def _html_head_bytes(html_bytes: bytes) -> bytes:
+    """Return the part of a page that can hold link-card metadata.
+
+    That is everything before the first </head>, or, when the page omits it
+    (which HTML permits), before the first <body>. Pages where neither is
+    found in the leading MAX_EMBED_HEAD_BYTES (for example UTF-16 pages) fall
+    back to that prefix.
+    """
+    window = html_bytes[:MAX_EMBED_HEAD_BYTES]
+    match = HTML_HEAD_END_REGEX.search(window) or HTML_BODY_START_REGEX.search(window)
+    return window[:match.start()] if match else window
+
+
 def _parse_embed_metadata(
     url: str,
     html_bytes: bytes,
@@ -2044,10 +2306,11 @@ def _parse_embed_metadata(
     """Parse HTML and extract all link-card metadata under one wall-clock budget.
 
     `_safe_download` releases its deadline when it returns, so without this the
-    parse is the one unbounded step in building a card. On timeout the worker is
-    abandoned (Python cannot cancel a running parse) and the caller degrades to
-    a bare card; the abandoned thread finishes on its own, bounded by
-    MAX_EMBED_HTML_BYTES, and is a daemon so it never delays exit.
+    parse is the one unbounded step in building a card. Only the page's head is
+    parsed, which keeps ordinary pages far inside the budget. On timeout the
+    worker is abandoned (Python cannot cancel a running parse) and the caller
+    degrades to a bare card; the abandoned thread finishes on its own, bounded
+    by MAX_EMBED_HEAD_BYTES, and is a daemon so it never delays exit.
     """
     def parse() -> tuple[Dict[str, Any], str]:
         # Prefer the server-declared charset; BeautifulSoup still falls back to
@@ -2055,7 +2318,7 @@ def _parse_embed_metadata(
         # absent or wrong, so a page served in a non-UTF-8 encoding is decoded
         # correctly.
         soup = BeautifulSoup(
-            html_bytes,
+            _html_head_bytes(html_bytes),
             "html.parser",
             from_encoding=_charset_from_content_type(content_type),
         )
@@ -2082,6 +2345,7 @@ def fetch_embed_url_card(pds_url: str, access_token: str, url: str) -> Dict:
         html_bytes, final_url, content_type = _safe_download(
             url,
             MAX_EMBED_HTML_BYTES,
+            allowed_content_types=EMBED_HTML_CONTENT_TYPES,
         )
         card, image_url = _parse_embed_metadata(url, html_bytes, content_type)
     except (requests.RequestException, ValueError, RecursionError) as exc:
@@ -2134,12 +2398,10 @@ def _build_embed(args: argparse.Namespace, access_token: str) -> Optional[Dict]:
     )
     media_embed: Optional[Dict] = None
     if args.image:
-        media_embed = upload_images(
-            args.pds_url,
-            access_token,
-            args.image,
-            args.alt_text,
-        )
+        prepared = getattr(args, "prepared_images", None)
+        if prepared is None:
+            prepared = prepare_images(args.image, args.alt_text)
+        media_embed = upload_images(args.pds_url, access_token, prepared)
     elif args.embed_url:
         media_embed = fetch_embed_url_card(
             args.pds_url,
@@ -2156,42 +2418,146 @@ def _build_embed(args: argparse.Namespace, access_token: str) -> Optional[Dict]:
     return record_embed or media_embed
 
 
-def create_post(args: argparse.Namespace) -> None:
-    session = bsky_login_session(args.pds_url, args.handle, args.password)
-    access_token = session["accessJwt"]
-    post = _build_post_record(args)
-    if embed := _build_embed(args, access_token):
-        post["embed"] = embed
+def _new_tid() -> str:
+    """Return a fresh TID record key: microsecond timestamp + random clock id."""
+    value = ((time.time_ns() // 1_000) << 10) | secrets.randbelow(1024)
+    return "".join(
+        TID_ALPHABET[(value >> shift) & 31] for shift in range(60, -1, -5)
+    )
 
-    print("Creating post.", file=sys.stderr)
-    if getattr(args, "verbose", False):
-        print(json.dumps(post, indent=2), file=sys.stderr)
 
+def _create_post_record(
+    pds_url: str,
+    access_token: str,
+    did: str,
+    post: Dict,
+    rkey: str,
+    *,
+    verbose: bool,
+) -> Any:
     with _open_api_response(
         "POST",
-        _api_url(args.pds_url, "com.atproto.repo.createRecord"),
+        _api_url(pds_url, "com.atproto.repo.createRecord"),
         timeout=30,
         operation="waiting for createRecord response headers",
         headers={"Authorization": "Bearer " + access_token},
         json={
-            "repo": session["did"],
+            "repo": did,
             "collection": "app.bsky.feed.post",
+            "rkey": rkey,
             "record": post,
         },
     ) as resp:
         _reject_redirect(resp, "createRecord")
         resp_body = _response_body(resp)
         if not resp.ok:
-            print(
+            if verbose:
+                print(json.dumps(resp_body, indent=2), file=sys.stderr)
+            # _api_error_summary already sanitizes the server's text.
+            raise requests.HTTPError(
                 f"createRecord failed with HTTP {resp.status_code}"
                 f"{_api_error_summary(resp_body)}.",
-                file=sys.stderr,
-            )  # _api_error_summary already sanitizes the server's text
-            if getattr(args, "verbose", False):
-                print(json.dumps(resp_body, indent=2), file=sys.stderr)
-        resp.raise_for_status()
+                response=resp,
+            )
+    return resp_body
 
-    print(json.dumps(resp_body, indent=2))
+
+def _existing_post(pds_url: str, did: str, rkey: str) -> Optional[Dict]:
+    """Return {uri, cid} if the post with this record key exists, else None."""
+    with _open_api_response(
+        "GET",
+        _api_url(pds_url, "com.atproto.repo.getRecord"),
+        timeout=15,
+        operation="waiting for getRecord response headers",
+        params={"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey},
+    ) as resp:
+        _reject_redirect(resp, "getRecord")
+        if resp.status_code in (400, 404):
+            body = _response_body(resp)
+            if resp.status_code == 404 or _api_error_name(body) == "RecordNotFound":
+                return None
+            raise ValueError(f"getRecord failed{_api_error_summary(body)}")
+        resp.raise_for_status()
+        data = _json_object(resp, "getRecord")
+    return record_ref(data)
+
+
+def _outcome_uncertain(exc: requests.RequestException) -> bool:
+    """Whether a failed createRecord may nonetheless have created the post.
+
+    A definite 4xx rejection did not; a timeout, a dropped connection, a broken
+    response body, or a 5xx from a gateway in front of the PDS all might have.
+    """
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        return response is None or response.status_code >= 500
+    return True
+
+
+def _publish_post(
+    pds_url: str,
+    access_token: str,
+    did: str,
+    post: Dict,
+    *,
+    verbose: bool,
+) -> Any:
+    """Create the post exactly once, even when the first attempt is ambiguous.
+
+    The record key is chosen here, so an uncertain first attempt can be
+    settled by looking the key up, and a retry with the same key can never
+    produce a second post: if the first attempt lands after all, one of the
+    two is rejected as a duplicate and the lookup finds the other.
+    """
+    rkey = _new_tid()
+    try:
+        return _create_post_record(pds_url, access_token, did, post, rkey, verbose=verbose)
+    except requests.RequestException as exc:
+        if not _outcome_uncertain(exc):
+            raise
+        print(
+            f"warning: createRecord did not complete ({type(exc).__name__}); "
+            "checking whether the post was created.",
+            file=sys.stderr,
+        )
+    existing = _existing_post(pds_url, did, rkey)
+    if existing is not None:
+        return existing
+    print(
+        "warning: the post was not created; retrying once with the same record key.",
+        file=sys.stderr,
+    )
+    try:
+        return _create_post_record(pds_url, access_token, did, post, rkey, verbose=verbose)
+    except requests.RequestException:
+        existing = _existing_post(pds_url, did, rkey)
+        if existing is not None:
+            return existing
+        raise
+
+
+def create_post(args: argparse.Namespace) -> None:
+    session = bsky_login_session(args.pds_url, args.handle, args.password)
+    try:
+        access_token = session["accessJwt"]
+        post = _build_post_record(args)
+        if embed := _build_embed(args, access_token):
+            post["embed"] = embed
+
+        print("Creating post.", file=sys.stderr)
+        verbose = bool(getattr(args, "verbose", False))
+        if verbose:
+            print(json.dumps(post, indent=2), file=sys.stderr)
+        resp_body = _publish_post(
+            args.pds_url, access_token, session["did"], post, verbose=verbose
+        )
+        print(json.dumps(resp_body, indent=2))
+    finally:
+        # Revoke the refresh token whether or not the post succeeded, so a
+        # long-lived credential never outlives this run.
+        refresh_token = session.get("refreshJwt")
+        if isinstance(refresh_token, str) and refresh_token:
+            bsky_logout_session(args.pds_url, refresh_token)
 
 
 def exit_error(*lines: str) -> None:
@@ -2199,6 +2565,17 @@ def exit_error(*lines: str) -> None:
     # server (an XRPC message, an HTTP reason phrase), so sanitize here rather
     # than trusting every call site to remember.
     raise SystemExit("\n".join(_terminal_safe(line) for line in lines))
+
+
+def exit_for_value_error(exc: ValueError) -> None:
+    """Exit with a ValueError's message, keeping its intended line breaks.
+
+    Some of this script's own messages span lines (a login failure and its
+    remedy). Remote fragments inside them are escaped where they are
+    interpolated, and _terminal_safe still neutralizes every other control
+    character in each line, so only a plain line break is honoured here.
+    """
+    exit_error(*f"Error: {exc}".split("\n"))
 
 
 def _check(condition: bool, message: str = "self-test check failed") -> None:
@@ -2770,7 +3147,7 @@ def test_login_failure_reports_server_error():
 def test_embed_thumbnail_uses_final_page_url():
     attached = {}
 
-    def fake_download(_url: str, _max_bytes: int):
+    def fake_download(_url: str, _max_bytes: int, **_kwargs):
         return (
             b'<html><head><meta property="og:image" content="../thumb.png">'
             b'<meta property="og:title" content="Title"></head></html>',
@@ -2919,10 +3296,10 @@ def test_inspect_image_rejects_webp_canvas_before_decoder():
     oversized[24:27] = (8000 - 1).to_bytes(3, "little")
     oversized[27:30] = (8000 - 1).to_bytes(3, "little")
 
-    def forbidden_decoder(_image: bytes):
+    def forbidden_decoder(_images: List[bytes]):
         raise AssertionError("oversized WebP reached the native decoder worker")
 
-    with _patched_globals(_inspect_image_in_worker=forbidden_decoder):
+    with _patched_globals(_inspect_images_in_worker=forbidden_decoder):
         with _check_raises(ValueError, "oversized canvas was accepted", contains="too many pixels"):
             inspect_image(bytes(oversized), "oversized.webp")
         with _check_raises(ValueError, "truncated RIFF was accepted", contains="container length"):
@@ -2972,7 +3349,9 @@ def test_inspect_image_exif_dimensions_and_upload_preserve_bytes():
         original = originals[6] + b"\x00unmodified transport payload\xff"
         path.write_bytes(original)
         with _patched_globals(upload_file=fake_upload):
-            embed = upload_images("https://pds.example", "test-token", [str(path)])
+            embed = upload_images(
+                "https://pds.example", "test-token", prepare_images([str(path)])
+            )
         _check_equal(uploaded, [(original, "image/jpeg")])
         _check_equal(embed["images"][0]["aspectRatio"], {"width": 3, "height": 8})
         _check_equal(path.read_bytes(), original)
@@ -3020,6 +3399,7 @@ def test_inspect_image_worker_timeout_reaps_process_without_credentials():
     ), _patched_globals(
         _IMAGE_WORKER_LAUNCHER="import time; time.sleep(30)",
         MAX_IMAGE_DECODE_SECONDS=0.1,
+        MAX_IMAGE_WORKER_STARTUP_SECONDS=0,
     ), _check_raises(ValueError, "image worker exceeded its deadline", contains="time limit"):
         inspect_image(buf.getvalue(), "slow.png")
     _check_equal(len(processes), 1)
@@ -3260,6 +3640,11 @@ def test_charset_from_content_type():
 
 def test_ascii_hostname():
     _check_equal(_ascii_hostname("example.com"), "example.com")
+    # Over-long internationalized names never reach idna.encode.
+    with _patched_attr(idna, "encode", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("over-long hostname reached idna.encode")
+    )), _check_raises(ValueError, "expected an over-long IDN to fail", contains="253"):
+        _ascii_hostname("\u0660" * 254)
     # Underscore labels are not valid IDNA2003 but resolve in practice; the
     # ASCII passthrough keeps them usable instead of raising.
     _check_equal(_ascii_hostname("my_cdn.example.com"), "my_cdn.example.com")
@@ -3345,7 +3730,7 @@ def test_nested_page_titles_are_bounded():
     html = (b"<html><head><title>" + b"<span>" * 1200 + b"Nested title"
             + b"</span>" * 1200 + b"</title></head></html>")
     with _patched_globals(
-        _safe_download=lambda *_a: (html, "https://example.com/", "text/html"),
+        _safe_download=lambda *_a, **_k: (html, "https://example.com/", "text/html"),
     ):
         embed = fetch_embed_url_card("https://pds.example", "token", "https://example.com/")
     _check_equal(embed["external"]["title"], "Nested title")
@@ -3361,7 +3746,7 @@ def test_embed_metadata_failures_degrade():
         raise RecursionError("pathological markup")
 
     with _patched_globals(
-        _safe_download=lambda *_a: (b"<title>text</title>", "https://example.com/", "text/html"),
+        _safe_download=lambda *_a, **_k: (b"<title>text</title>", "https://example.com/", "text/html"),
         _external_card_metadata=fail_metadata,
     ), _patched_attr(sys, "stderr", io.StringIO()):
         embed = fetch_embed_url_card("https://pds.example", "token", "https://example.com/")
@@ -3432,11 +3817,11 @@ def test_compressed_response_refused_with_unsafe_decoder():
         def iter_content(self, _chunk_size):
             raise AssertionError("unsafe decoder must never be entered")
 
-    for version in ("2.3.0", "2.6.3", "2.7.0rc1", "unknown"):
+    for version in ("2.3.0", "2.6.3", "2.7.0", "2.8.0rc1", "unknown"):
         with _patched_globals(_URLLIB3_VERSION=version), _check_raises(
             ValueError,
             "expected unsafe decoder version to be refused",
-            contains="urllib3 2.7.0 or newer",
+            contains="urllib3 2.8.0 or newer",
         ):
             _read_response_body(UnreadResponse(), 1024)
 
@@ -3550,6 +3935,364 @@ def test_real_redirect_bodies_stay_unread():
                 _check_equal(len(calls), 1)
         _check_equal(redirect_body.bytes_read, 0)
         _check(redirect_body.closed, "unread redirect body was not closed")
+
+
+_TEST_CID = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+class _FakeJsonResponse:
+    """A streamed API response carrying a JSON body, for the self-tests."""
+
+    def __init__(self, status_code: int, body: Any):
+        self.status_code = status_code
+        self.ok = status_code < 400
+        self.headers: Dict[str, str] = {}
+        self.closed = False
+        self._body = json.dumps(body).encode("UTF-8")
+
+    def close(self):
+        self.closed = True
+
+    def iter_content(self, _chunk_size: int):
+        yield self._body
+
+    def raise_for_status(self):
+        if not self.ok:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+def test_exit_for_value_error_keeps_line_breaks():
+    try:
+        exit_for_value_error(ValueError("Login failed.\nUse an APP password\x1b[2J"))
+    except SystemExit as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("exit_for_value_error did not raise")
+    _check_equal(message.split("\n"), ["Error: Login failed.", "Use an APP password\\x1b[2J"])
+
+
+def test_new_tid_is_a_sortable_record_key():
+    tid_regex = re.compile(r"^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$")
+    for _ in range(50):
+        tid = _new_tid()
+        _check(tid_regex.fullmatch(tid) is not None, tid)
+        _validate_record_key(tid)
+    earlier = _new_tid()
+    time.sleep(0.002)
+    _check(earlier < _new_tid(), "TIDs must sort by creation time")
+
+
+def test_publish_post_settles_an_uncertain_create():
+    attempts: List[str] = []
+    lookups: List[str] = []
+    exists = [False]
+
+    def found_ref(rkey: str) -> Dict:
+        return {"uri": f"at://did:plc:me/app.bsky.feed.post/{rkey}", "cid": _TEST_CID}
+
+    def lookup(_pds: str, _did: str, rkey: str) -> Optional[Dict]:
+        lookups.append(rkey)
+        return found_ref(rkey) if exists[0] else None
+
+    def publish() -> Any:
+        with _patched_attr(sys, "stderr", io.StringIO()):
+            return _publish_post("https://pds.example", "token", "did:plc:me", {}, verbose=False)
+
+    # A timed-out attempt that did land is found, not posted a second time.
+    def landed_then_timed_out(_pds, _token, _did, _post, rkey, *, verbose):
+        attempts.append(rkey)
+        exists[0] = True
+        raise DeadlineExceeded("timed out")
+
+    with _patched_globals(_create_post_record=landed_then_timed_out, _existing_post=lookup):
+        result = publish()
+    _check_equal(len(attempts), 1)
+    _check_equal(lookups, attempts)
+    _check_equal(result, found_ref(attempts[0]))
+
+    # Not found, so retried once with the same key. The first attempt lands
+    # late and the retry is rejected as a duplicate; the lookup settles it.
+    attempts.clear(), lookups.clear()
+    exists[0] = False
+
+    def dropped_then_duplicate(_pds, _token, _did, _post, rkey, *, verbose):
+        attempts.append(rkey)
+        if len(attempts) == 1:
+            raise requests.ConnectionError("connection reset")
+        exists[0] = True
+        raise requests.HTTPError("duplicate", response=_FakeJsonResponse(400, {}))
+
+    with _patched_globals(_create_post_record=dropped_then_duplicate, _existing_post=lookup):
+        result = publish()
+    _check_equal(len(attempts), 2)
+    _check_equal(attempts[0], attempts[1])
+    _check_equal(lookups, attempts)
+    _check_equal(result, found_ref(attempts[0]))
+
+    # A definite 4xx rejection is neither looked up nor retried.
+    attempts.clear()
+
+    def rejected(_pds, _token, _did, _post, rkey, *, verbose):
+        attempts.append(rkey)
+        raise requests.HTTPError("invalid record", response=_FakeJsonResponse(400, {}))
+
+    def forbidden_lookup(*_args):
+        raise AssertionError("a definite rejection must not be looked up")
+
+    with _patched_globals(
+        _create_post_record=rejected, _existing_post=forbidden_lookup
+    ), _check_raises(requests.HTTPError, "expected a 4xx rejection to propagate"):
+        publish()
+    _check_equal(len(attempts), 1)
+
+
+def test_existing_post_lookup():
+    with _patched_api_session(_FakeJsonResponse(400, {"error": "RecordNotFound"})) as session:
+        _check(_existing_post("https://pds.example", "did:plc:me", "3kabc") is None)
+    _check_equal(session.calls[0][2]["params"], {
+        "repo": "did:plc:me", "collection": "app.bsky.feed.post", "rkey": "3kabc",
+    })
+    ref = {"uri": "at://did:plc:me/app.bsky.feed.post/3kabc", "cid": _TEST_CID}
+    with _patched_api_session(_FakeJsonResponse(200, dict(ref, value={}))):
+        _check_equal(_existing_post("https://pds.example", "did:plc:me", "3kabc"), ref)
+    with _patched_api_session(_FakeJsonResponse(400, {"error": "InvalidRequest"})), _check_raises(
+        ValueError, "expected an unrelated 400 to fail", contains="InvalidRequest"
+    ):
+        _existing_post("https://pds.example", "did:plc:me", "3kabc")
+
+
+def test_create_post_always_revokes_its_session():
+    revoked = []
+    args = argparse.Namespace(pds_url="https://pds.example", handle="alice.test",
+                              password="secret", verbose=False)
+
+    def failing_publish(*_args, **_kwargs):
+        raise requests.HTTPError("createRecord failed")
+
+    for publish in (lambda *_a, **_k: {"uri": "at://ok"}, failing_publish):
+        with _patched_globals(
+            bsky_login_session=lambda *_a: {
+                "accessJwt": "access", "refreshJwt": "refresh", "did": "did:plc:me",
+            },
+            _build_post_record=lambda _args: {"$type": "app.bsky.feed.post", "text": "t"},
+            _build_embed=lambda *_a: None,
+            _publish_post=publish,
+            bsky_logout_session=lambda pds, token: revoked.append((pds, token)),
+        ), _patched_attr(sys, "stdout", io.StringIO()), _patched_attr(sys, "stderr", io.StringIO()):
+            try:
+                create_post(args)
+            except requests.HTTPError:
+                pass
+    _check_equal(revoked, [("https://pds.example", "refresh")] * 2)
+
+
+def test_logout_sends_refresh_token_and_tolerates_failure():
+    with _patched_api_session(_FakeJsonResponse(200, {})) as session:
+        bsky_logout_session("https://pds.example", "refresh-token")
+    method, url, options = session.calls[0]
+    _check_equal((method, url), ("POST", "https://pds.example/xrpc/com.atproto.server.deleteSession"))
+    _check_equal(options["headers"], {"Authorization": "Bearer refresh-token"})
+
+    with _patched_api_session(_FakeJsonResponse(500, {})), _patched_attr(
+        sys, "stderr", io.StringIO()
+    ) as captured_stderr:
+        bsky_logout_session("https://pds.example", "refresh-token")
+    _check("could not end the login session" in captured_stderr.getvalue())
+
+
+def test_link_card_metadata_is_trimmed():
+    soup = BeautifulSoup(
+        '<meta property="og:title" content="  "><title>Real title</title>'
+        '<meta property="og:image" content="\n  https://cdn.example/a.jpg\n">',
+        "html.parser",
+    )
+    _check_equal(_external_card_metadata("https://example.com/", soup)["title"], "Real title")
+    _check_equal(_meta_content(soup, "og:image"), "https://cdn.example/a.jpg")
+
+
+def test_html_head_bytes():
+    _check_equal(
+        _html_head_bytes(b"<html><HEAD><title>t</title></HEAD ><body>x</body>"),
+        b"<html><HEAD><title>t</title>",
+    )
+    # </header> is not </head>; without </head>, the head ends at <body>.
+    _check_equal(
+        _html_head_bytes(b"<title>t</title><header>h</header><BODY class=x>y"),
+        b"<title>t</title><header>h</header>",
+    )
+    _check_equal(len(_html_head_bytes(b"a" * (MAX_EMBED_HEAD_BYTES + 10))), MAX_EMBED_HEAD_BYTES)
+    card, _ = _parse_embed_metadata(
+        "https://example.com/",
+        b"<head><title>Head title</title></head><body><title>Body</title>",
+        "text/html",
+    )
+    _check_equal(card["title"], "Head title")
+
+
+def test_safe_download_refuses_non_html_before_reading_body():
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, content_type: Optional[str]):
+            self.headers = {"Content-Type": content_type} if content_type else {}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, _chunk_size: int):
+            if self.headers.get("Content-Type") == "application/pdf":
+                raise AssertionError("a refused body must never be read")
+            yield b"ok"
+
+    for content_type, allowed in (
+        ("application/pdf", False),
+        ("Text/HTML; charset=utf-8", True),
+        ("application/xhtml+xml", True),
+        (None, True),
+    ):
+        @contextmanager
+        def fake_open(_url: str, _timeout: float):
+            yield FakeResponse(content_type)
+
+        with _patched_globals(_open_pinned_response=fake_open):
+            if allowed:
+                body, _, _ = _safe_download(
+                    "https://example.com/", 100, allowed_content_types=EMBED_HTML_CONTENT_TYPES
+                )
+                _check_equal(body, b"ok")
+            else:
+                with _check_raises(ValueError, "expected a PDF to be refused", contains="application/pdf"):
+                    _safe_download(
+                        "https://example.com/", 100, allowed_content_types=EMBED_HTML_CONTENT_TYPES
+                    )
+
+
+def test_hashtags_follow_the_official_composer():
+    _check_equal(parse_hashtags("#foo​bar"), [{"start": 0, "end": 4, "tag": "foo"}])
+    _check_equal(parse_hashtags("#\U0001f468‍\U0001f469"), [
+        {"start": 0, "end": 5, "tag": "\U0001f468"},
+    ])
+    _check_equal(parse_hashtags("#❤️love"), [
+        {"start": 0, "end": 11, "tag": "❤️love"},
+    ])
+    _check_equal(parse_hashtags("#️x"), [])
+    # Only ASCII digits make a tag "numeric only".
+    _check_equal(parse_hashtags("#² #123"), [{"start": 0, "end": 3, "tag": "²"}])
+
+
+def test_parse_bsky_app_uri_lowercases_handles_only():
+    _check_equal(
+        parse_uri("https://bsky.app/profile/Alice.Example.COM/post/abc")["repo"],
+        "alice.example.com",
+    )
+    _check_equal(parse_uri("https://bsky.app/profile/did:plc:AbC/post/abc")["repo"], "did:plc:AbC")
+
+
+def test_get_record_rejects_a_different_record():
+    def answer(uri: str) -> _FakeJsonResponse:
+        return _FakeJsonResponse(200, {"uri": uri, "cid": _TEST_CID, "value": {}})
+
+    requested = "at://did:plc:abc/app.bsky.feed.post/one"
+    with _patched_api_session(answer(requested)):
+        _check_equal(get_record("https://api.example", requested)["uri"], requested)
+    # A handle-addressed request is answered with the account's DID.
+    with _patched_api_session(answer(requested)):
+        get_record("https://api.example", "https://bsky.app/profile/alice.test/post/one")
+    for wrong in (
+        "at://did:plc:abc/app.bsky.feed.post/other",
+        "at://did:plc:xyz/app.bsky.feed.post/one",
+        "at://did:plc:abc/app.bsky.graph.list/one",
+    ):
+        with _patched_api_session(answer(wrong)), _check_raises(
+            ValueError, f"accepted {wrong}", contains="different record"
+        ):
+            get_record("https://api.example", requested)
+
+
+def test_mentions_resolve_concurrently_under_one_deadline():
+    seen = []
+
+    def slow_resolve(_pds_url: str, handle: str) -> Optional[str]:
+        seen.append(_DOWNLOAD_DEADLINE.get())
+        time.sleep(0.2)
+        return None if handle.startswith("nobody") else "did:plc:" + handle.split(".")[0]
+
+    handles = [f"user{index}.test" for index in range(MENTION_RESOLUTION_WORKERS)]
+    with _patched_globals(_resolve_handle=slow_resolve):
+        started = time.monotonic()
+        resolved = _resolve_handles("https://pds.example", handles)
+        elapsed = time.monotonic() - started
+    _check(elapsed < 0.2 * len(handles) / 2, f"mentions were resolved serially ({elapsed:.2f}s)")
+    _check_equal(resolved, {handle: "did:plc:" + handle.split(".")[0] for handle in handles})
+    _check(None not in seen and len(set(seen)) == 1, "lookups did not share one deadline")
+
+    with _patched_globals(_resolve_handle=slow_resolve), _patched_attr(
+        sys, "stderr", io.StringIO()
+    ) as captured_stderr:
+        facets = parse_facets("https://pds.example", "hi @nobody.test and @Bob.test and @bob.test")
+    _check("@nobody.test" in captured_stderr.getvalue())
+    _check_equal([facet["features"][0]["did"] for facet in facets], ["did:plc:bob"] * 2)
+
+
+def test_upload_timeout_scales_with_size():
+    _check_equal(_upload_timeout(0), UPLOAD_BASE_TIMEOUT_SECONDS)
+    # A maximum-size image must fit on a 256 kbit/s uplink.
+    _check(_upload_timeout(MAX_IMAGE_SIZE_BYTES) > MAX_IMAGE_SIZE_BYTES * 8 / 256_000)
+    body = b"\x89PNG\r\n\x1a\n" + b"x" * 1000
+    with _patched_api_session(_FakeJsonResponse(200, {"blob": {"$type": "blob"}})) as session:
+        upload_file("https://pds.example", "token", body, "image/png")
+    _check_equal(session.calls[0][2]["timeout"], _upload_timeout(len(body)))
+
+
+def test_prepare_images_uses_one_worker_per_batch():
+    runs = []
+    original_run = subprocess.run
+
+    def recording_run(*args, **kwargs):
+        runs.append(kwargs["timeout"])
+        return original_run(*args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as directory:
+        paths = []
+        for index, size in enumerate(((2, 3), (4, 5))):
+            path = Path(directory) / f"image{index}.png"
+            Image.new("RGB", size).save(path, format="PNG")
+            paths.append(str(path))
+        with _patched_attr(subprocess, "run", recording_run):
+            prepared = prepare_images(paths, ["first", "second"])
+        _check_equal(len(runs), 1)
+        _check_equal(runs[0], MAX_IMAGE_WORKER_STARTUP_SECONDS + 2 * MAX_IMAGE_DECODE_SECONDS)
+        _check_equal(
+            [(info["width"], info["height"], alt) for _, info, alt in prepared],
+            [(2, 3, "first"), (4, 5, "second")],
+        )
+
+        broken = Path(directory) / "broken.png"
+        broken.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not really a PNG")
+        with _check_raises(ValueError, "a bad image in a batch was not named",
+                           contains=f"{str(broken)!r}"):
+            prepare_images([paths[0], str(broken)])
+
+
+def test_main_validates_images_before_logging_in():
+    def forbidden_login(*_args):
+        raise AssertionError("logged in before the local images were validated")
+
+    environment = dict(os.environ, ATP_AUTH_HANDLE="alice.test", ATP_AUTH_PASSWORD="secret")
+    for name in ("ATP_PDS_HOST", "ATP_RECORD_SERVICE_HOST"):
+        environment.pop(name, None)
+    with tempfile.TemporaryDirectory() as directory:
+        missing = str(Path(directory) / "missing.jpg")
+        with _patched_attr(os, "environ", environment), _patched_attr(
+            sys, "argv", ["create_bsky_post.py", "hello", "--image", missing]
+        ), _patched_globals(bsky_login_session=forbidden_login):
+            try:
+                main()
+            except SystemExit as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("main() accepted a missing image")
+    _check("Could not read image file" in message, message)
 
 
 def run_self_tests() -> None:
@@ -3744,9 +4487,14 @@ def _missing_content_usage(prog: str) -> tuple[str, ...]:
     return (
         "Error: Post text or an embed is required.",
         "",
-        "First, set your credentials as environment variables:",
+        "First, set your credentials as environment variables. The hidden",
+        "prompt keeps the password out of your shell history:",
         "  $ export ATP_AUTH_HANDLE='your-handle.bsky.social'",
-        "  $ export ATP_AUTH_PASSWORD='xxxx-xxxx-xxxx-xxxx'",
+        "  $ read -r -s -p 'Bluesky app password: ' ATP_AUTH_PASSWORD",
+        "  $ printf '\\n'",
+        "  $ export ATP_AUTH_PASSWORD",
+        "",
+        "Run 'unset ATP_AUTH_PASSWORD' when you finish posting.",
         "",
         "ATP_AUTH_PASSWORD must be an APP password, created at",
         "https://bsky.app/settings/app-passwords - do NOT use your main",
@@ -3834,7 +4582,7 @@ def main():
     try:
         validate_args(args)
     except ValueError as e:
-        exit_error(f"Error: {e}")
+        exit_for_value_error(e)
 
     if args.password:
         print(
@@ -3852,12 +4600,21 @@ def main():
             "or use --handle and --password arguments.",
         )
 
+    # Local files are read and decoded before logging in, so a missing or
+    # malformed image fails without any network request having been made.
+    args.prepared_images = None
+    if args.image:
+        try:
+            args.prepared_images = prepare_images(args.image, args.alt_text)
+        except ValueError as e:
+            exit_for_value_error(e)
+
     try:
         create_post(args)
     except requests.RequestException as e:
         exit_error(f"Error: API request failed: {e}")
     except ValueError as e:
-        exit_error(f"Error: {e}")
+        exit_for_value_error(e)
 
 
 if __name__ == "__main__":

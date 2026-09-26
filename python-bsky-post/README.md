@@ -27,9 +27,10 @@ These are selected pins, not a complete dependency lock: `certifi`,
 within their dependencies' allowed ranges. Fully repeatable installs require
 locking those transitive dependencies and recording the target environment.
 
-The pins include urllib3 2.7.0 for bounded streaming decompression and Pillow
-12.3.0 for image inspection. Older or unrecognized urllib3 releases refuse
-compressed responses before reading them. Accepted response codings are
+The pins include urllib3 2.8.0 for bounded streaming decompression and safe
+chunked reads, requests 2.34.2 and idna 3.20 with their security fixes, and
+Pillow 12.3.0 for image inspection. Older or unrecognized urllib3 releases
+refuse compressed responses before reading them. Accepted response codings are
 identity, gzip/x-gzip and deflate; unsupported codings use the existing error
 or link-card fallback path.
 
@@ -95,17 +96,31 @@ python3 create_bsky_post.py --help
 
 `--verbose` prints the complete pending record before it is sent, plus the
 body of a failed `createRecord` — the quickest way to inspect the facets and
-embeds the script built for you.
+embeds the script built for you. It is not a dry run: the post is still
+published.
+
+**Images are uploaded byte for byte, metadata included.** EXIF data such as
+GPS location and camera details becomes part of the public blob, which anyone
+can download through `com.atproto.sync.getBlob` even though the Bluesky app
+displays re-encoded copies. Remove metadata you don't want published before
+posting. Blanket metadata strippers also remove any data you have deliberately
+embedded in those segments.
 
 Server error messages are escaped for terminal safety but are not redacted
 for secrets. A server could echo credentials, so check diagnostics before
 sharing them.
 
-If `createRecord` times out, the post may already have been committed. Check
-your account's recent posts and resolve the first attempt's outcome before
-retrying: the script supplies no persistent record key, and re-running it can
-create a duplicate. Timeouts in optional mentions and card thumbnails instead
-allow posting to continue with those features omitted.
+If `createRecord` ends ambiguously (a timeout, a dropped connection, or a 5xx
+error), the script settles it itself. It chose the post's record key, so it
+looks that key up, and if the post is not there, retries once with the same
+key. A key can hold only one record, so at most one post is created. Only if
+those lookups fail too is the outcome left unknown; check your profile before
+re-running, because a new run uses a new key. Failures in optional work
+(mention lookups, card thumbnails) instead let posting continue with those
+features omitted.
+
+The login session is revoked (`com.atproto.server.deleteSession`) when the
+run ends, whether or not the post succeeded.
 
 ### Services
 
@@ -126,10 +141,12 @@ Tests
 The script carries its own test suite — facet parsers, URI and CID
 validation, SSRF and IDN handling (including NAT64-translated addresses),
 redirect limits, response size and content-encoding limits, image file safety,
-login error reporting, terminal-safe rendering of server-supplied text, the
-link-card metadata budget, deeply nested titles, real compressed-response
-allocation limits, unread redirect bodies, bounded image decoding, EXIF display
-dimensions, and the card/thumbnail degradation paths:
+login, logout and error reporting, terminal-safe rendering of server-supplied
+text, the link-card metadata budget and head-only parsing, deeply nested
+titles, real compressed-response allocation limits, unread redirect bodies,
+bounded batch image decoding, EXIF display dimensions, concurrent mention
+resolution, the settling of an ambiguous `createRecord`, and the
+card/thumbnail degradation paths:
 
 ```shell
 python3 create_bsky_post.py --self-test
@@ -142,8 +159,8 @@ that no `assert` statements have crept in that optimization would strip — an
 It also runs the documentation-excerpt checker, its regression tests, and the
 Rust mirror comparison.
 
-The companion walkthrough quotes this script directly, so a third check keeps
-the two from drifting apart:
+The companion walkthrough quotes this script directly. The documentation
+check that keeps the two from drifting apart can also be run on its own:
 
 ```shell
 python3 verify_doc_excerpts.py
@@ -174,19 +191,24 @@ What the hardening covers
   them. Each request gets its own HTTP session, so a call abandoned at its
   deadline can never disturb a later one.
 * **Input validation.** AT URIs, record CIDs, handles, BCP 47 language tags
-  and URLs are all checked before use; image files are read symlink-safely
-  and bounded by size, dimensions and pixel count. WebP canvas dimensions are
-  checked before native decoder construction. Images must fully decode within
-  five seconds in a separate process; on POSIX it also enforces a 768 MiB
-  address-space limit and CPU/output-file limits. Animation is capped at
-  100 frames and 80 million total decoded pixels. EXIF orientation determines
-  display dimensions, while the original bytes are uploaded unchanged.
+  and URLs are all checked before use. Image files are refused if the final
+  path component is a symlink or the file is not a regular file, and are
+  bounded by size, dimensions and pixel count. All images are read and
+  validated before login. WebP canvas dimensions are checked before native
+  decoder construction. A post's images are fully decoded in one separate
+  process, allowed 15 seconds for start-up plus five seconds per image; where
+  Python's `resource` module is available it also sets a 768 MiB address-space
+  limit (enforced on Linux; not, as far as we know, on macOS) and CPU and
+  output-file limits. Animation is capped at 100 frames and 80 million total
+  decoded pixels. EXIF orientation determines display dimensions, while the
+  original bytes are uploaded unchanged.
 * **Output safety.** Error text that came from the network — an XRPC error
   message, an HTTP reason phrase — is printed with control characters escaped,
   so a hostile server cannot rewrite your terminal or forge a prompt asking
   you to re-enter your app password.
-* **Graceful degradation.** A failed thumbnail, an unreadable embed page or
-  an unresolvable mention costs you that one feature, never the post.
+* **Graceful degradation.** A failed thumbnail, an unreadable or non-HTML
+  embed page, or an unresolvable mention costs you that one feature, never the
+  post. Mention lookups run concurrently under one shared deadline.
 
 Credits
 -------

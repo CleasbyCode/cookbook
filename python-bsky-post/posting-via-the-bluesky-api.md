@@ -5,7 +5,7 @@ A guide to creating posts via the Bluesky API, including rich-text facets
 and website cards — with the safety rails a script needs when it fetches
 untrusted content from the open web.
 
-*July 23, 2026 — updated September 7, 2026*
+*July 23, 2026 — updated September 25, 2026*
 
 This post is an updated companion to the AT Protocol team's original
 [Posting via the Bluesky API](https://atproto.com/blog/create-post)
@@ -102,8 +102,12 @@ fork differs from the original — why.
 
 Posting requires a session. The script calls
 `com.atproto.server.createSession` with your handle and app password and
-receives an access token (`accessJwt`) plus your account DID. Since the
-script publishes a single post, it never needs the refresh token.
+receives an access token (`accessJwt`), a refresh token (`refreshJwt`), and
+your account DID. Since the script publishes a single post, it never refreshes
+the session. Instead, when the run ends, whether the post succeeded or not, it
+revokes the session with `com.atproto.server.deleteSession`, so the
+long-lived refresh token does not stay valid on the server after the script
+exits.
 
 ```python
 def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
@@ -136,14 +140,15 @@ to bounce a request carrying your password somewhere else. The response is
 read through a size-capped, deadline-bounded reader rather than trusted
 blindly. And the failure path reads the XRPC error body instead of raising a
 bare `401 Client Error`, because login is where a first-time user is most
-likely to get stuck and the status code alone never says why:
+likely to get stuck and the status code alone never says why. The output is
+two lines, the server's error and then the hint (wrapped here for width):
 
 ```
-Error: Login failed with HTTP 401 (AuthFactorTokenRequired: A sign in code
-has been sent to your email address).
+Error: Login failed with HTTP 401 (AuthFactorTokenRequired: A sign in code has
+    been sent to your email address).
 This account has email two-factor authentication enabled, which the account
-password cannot bypass. Use an APP password instead, created at
-https://bsky.app/settings/app-passwords.
+    password cannot bypass. Use an APP password instead, created at
+    https://bsky.app/settings/app-passwords.
 ```
 
 The hint is looked up from the error name for the handful of cases with an
@@ -200,14 +205,11 @@ post: Dict = {
 }
 ```
 
-`verify_doc_excerpts.py` compares each Python excerpt's complete statements
-with a contiguous statement sequence in the script's syntax tree. It ignores
-comments and formatting, but checks statement order, nesting, exception types,
-and literal values. Separate excerpts show code from separate locations; no
-elisions are silently accepted. The checker also parses every JSON example.
-
 The finished record goes to `com.atproto.repo.createRecord`, and the response
-contains the new post's AT URI and CID.
+contains the new post's AT URI and CID. Unlike the original, the script picks
+the record key itself: a fresh TID (a timestamp-based identifier, the same kind
+the PDS would otherwise generate). Why that matters is covered under
+[the security layer](#the-security-layer).
 
 The script validates the text length against the lexicon's 3,000-byte
 `maxLength` before posting. The separate 300-*grapheme* limit is left to the
@@ -262,13 +264,18 @@ def _byte_offsets(text: str) -> List[int]:
 Mentions are matched with a handle regex based on the
 [handle syntax spec](https://atproto.com/specs/handle), then each candidate
 is resolved to a DID via `com.atproto.identity.resolveHandle`. If a handle
-doesn't resolve — including because the lookup timed out — it's skipped and
-simply renders as plain text, same behavior as the original. The fork adds:
+doesn't resolve, it's skipped and simply renders as plain text, with a warning
+naming it. The original skipped only a handle the server rejected with HTTP 400;
+it set no timeout, so a stalled lookup hung it, and any other error stopped it.
+The fork skips a handle whatever the failure, timeouts included, and adds:
 
 * a Unicode-aware word-boundary check, so `email@example.com` is not treated
   as a mention of `example.com`,
 * a 253-character handle length cap and strict `HANDLE_REGEX` fullmatch,
-* per-post caching, so the same handle mentioned twice is resolved once,
+* case-insensitive de-duplication, so the same handle mentioned twice is
+  resolved once,
+* concurrent lookups (up to 8 at a time) sharing one 20-second overall budget,
+  so a post full of unresolvable handles cannot stall for minutes,
 * validation that the returned DID actually looks like a DID.
 
 ### Links
@@ -282,9 +289,12 @@ no embedded credentials before it becomes a facet.
 
 ### Hashtags and cashtags
 
-New in the fork. Hashtags support the fullwidth `＃` as well as `#`, strip
-trailing punctuation, reject tags that are all digits or punctuation, filter
-out invisible characters, and enforce the 64-grapheme / 640-byte lexicon
+New in the fork. Hashtags follow the official composer's rules: they support
+the fullwidth `＃` as well as `#`, end at whitespace or at an invisible
+character such as a zero-width space or joiner (so `#foo` followed by a
+zero-width space and `bar` tags `foo`), may not start with a variation
+selector, strip trailing punctuation, and are rejected when made only of ASCII
+digits and punctuation. They also enforce the 64-grapheme / 640-byte lexicon
 limits with a conservative count. Nonspacing and enclosing combining marks
 extend the preceding cluster, but spacing marks are counted separately: some,
 including Myanmar U+102B, begin new graphemes. Tags that exceed the bound remain
@@ -292,7 +302,9 @@ plain text; their presence does not invalidate the post. Cashtags like `$TSLA`
 become tags too:
 
 ```python
-HASHTAG_REGEX = re.compile(r"(^|\s)([#＃])(\S+)")
+HASHTAG_REGEX = re.compile(
+    r"(^|\s)([#＃])(?!️)([^\s­⁠ ​‌‍⃢]+)"
+)
 CASHTAG_REGEX = re.compile(
     r"(^|\s|\()\$([A-Za-z][A-Za-z0-9]{0,4})"
     r"(?=\s|$|[.,;:!?)\"'\u2019])"
@@ -325,15 +337,20 @@ root — with several correctness fixes layered on:
 * every URI is validated as a real `app.bsky.feed.post` reference, and every
   CID is checked to be a canonical base32 CIDv1 (dag-cbor, SHA-256) — the
   fork round-trips the decode/re-encode rather than pattern-matching;
-* `getRecord` responses are size-capped and shape-checked before use.
+* `getRecord` responses are size-capped and shape-checked before use, and
+  the returned record must be the one requested: same collection and record
+  key, and the same DID when the request named one. (A request made with a
+  handle is answered with the account's DID, which cannot be compared without
+  a separate lookup.)
 
 ## Quote Posts and Record-with-Media
 
 `--embed-ref` embeds a strong reference to another record
-(`app.bsky.embed.record`). Posts, lists (`app.bsky.graph.list`), and feed
-generators (`app.bsky.feed.generator`) are supported, and you can pass either
-an `at://` URI or a `https://bsky.app/profile/…` URL — the script maps the
-web path to the right collection.
+(`app.bsky.embed.record`). You can pass an `at://` URI for any record, or a
+`https://bsky.app/profile/…` URL for a post, a list (`app.bsky.graph.list`),
+or a feed generator (`app.bsky.feed.generator`); the script maps the web path
+to the right collection. A handle in a `bsky.app` URL may be written in any
+case, since handles are case-insensitive.
 
 If you combine `--embed-ref` with `--image` or `--embed-url`, the script
 produces the `app.bsky.embed.recordWithMedia` union that the original never
@@ -353,43 +370,69 @@ with the uploaded image entries described below before posting:
 
 Each post can carry up to four images. Since April 2026 each image blob may
 be up to **2,000,000 bytes**, raised from the 1 MB limit that applied when the
-original blog post was written; the same announcement reported a higher
-maximum resolution (4000×4000, up from 2000px). Service-side limits are not
-part of the lexicon and can change without one, so treat those figures as
-"as announced in April 2026" rather than as something this script depends on
-— it checks the byte limit, which is the one that makes an upload fail, and
-enforces it locally so oversized files fail fast with a clear message.
+original blog post was written. That limit is part of the lexicon: the
+`app.bsky.embed.images` schema declares `maxSize: 2000000` on the image blob,
+and the script enforces it locally so oversized files fail fast with a clear
+message instead of being rejected when the post is created. The same
+announcement reported a higher maximum resolution (4000×4000, up from 2000px).
+That one is a service rule rather than a lexicon constraint, so treat it as "as
+announced in April 2026"; the script does not depend on it.
 
 Its own dimension caps (16,384px per side, 40 megapixels) are deliberately
 *looser* than the service's — they are local decompression-bomb guards, not a
 mirror of the server's rules, and they exist to bound Pillow's memory use
 before the service ever sees the file.
 
-Files are read defensively — opened with `O_NOFOLLOW` (with an
-lstat/fstat identity check on platforms that lack it) and required to be
-regular files, so the script can't be tricked into uploading
-`/dev/stdin` or a symlink target. Each image passes a format check before Pillow
-is started. WebP RIFF canvas dimensions are checked here too, because its
-native decoder can allocate canvas buffers during `Image.open()`, before
-Pillow returns dimensions to the caller:
+Files are read defensively: opened with `O_NOFOLLOW` (with an lstat/fstat
+identity check on platforms that lack it) and required to be regular files.
+So a path whose final component is a symlink, or a device such as
+`/dev/stdin`, is refused. Symlinked *directories* earlier in the path are still
+followed; the check guards the file itself, not every component leading to it.
+
+All of a post's images are read and validated before the script logs in, so a
+typo in the fourth filename fails the command before any network request is
+made and before a single blob is uploaded. Each image first passes a format
+check in the parent process. WebP RIFF canvas dimensions are checked here too,
+because its native decoder can allocate canvas buffers during `Image.open()`,
+before Pillow returns dimensions to the caller. Then the whole batch is decoded
+in one worker process:
 
 ```python
-def inspect_image(img_bytes: bytes, source: str) -> Dict[str, Any]:
+def inspect_images(images: List[tuple[bytes, str]]) -> List[Dict[str, Any]]:
+    """Validate (bytes, source) pairs; the sources only label errors."""
+    if not images:
+        return []
+    for img_bytes, source in images:
+        try:
+            # This check runs before even starting a native decoder process.
+            _preflight_image(img_bytes)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Invalid image {source!r}: {exc}") from exc
     try:
-        # This check runs before even starting a native decoder process.
-        _preflight_image(img_bytes)
-        return _inspect_image_in_worker(img_bytes)
+        results = _inspect_images_in_worker([img_bytes for img_bytes, _ in images])
     except (OSError, ValueError) as exc:
-        raise ValueError(f"Invalid image {source!r}: {exc}") from exc
+        noun = "image" if len(images) == 1 else "images"
+        sources = ", ".join(repr(source) for _, source in images)
+        raise ValueError(f"Invalid {noun} {sources}: {exc}") from exc
+    infos: List[Dict[str, Any]] = []
+    for (_, source), result in zip(images, results):
+        if "error" in result:
+            raise ValueError(f"Invalid image {source!r}: {result['error']}")
+        infos.append(result["image"])
+    return infos
 ```
 
-The worker verifies container integrity and fully decodes the image. JPEG
+The worker verifies container integrity and fully decodes each image. JPEG
 `verify()` alone does not reject truncated pixel data. The parent kills and
-reaps the worker if it exceeds five seconds; on POSIX the worker also installs
-a 768 MiB address-space limit, a CPU limit, and a 4 KiB output-file limit before
-loading the helper. It receives image bytes without the parent's posting
-credentials. Animation is limited to 100 frames and 80 million total decoded
-pixels. Image bytes are never re-encoded or rewritten during validation.
+reaps the worker if it runs longer than 15 seconds for interpreter start-up
+plus five seconds per image. Where Python's `resource` module is available, the
+worker also installs a 768 MiB address-space limit, a matching CPU-time limit,
+and a 16 KiB output-file limit before loading the helper. These limits are
+enforced on Linux; macOS accepts the address-space limit but, as far as we
+know, does not enforce it. The worker receives image bytes without the parent's
+posting credentials. Animation is limited to 100 frames and 80 million total
+decoded pixels. Image bytes are never re-encoded or rewritten during
+validation.
 
 This provides:
 
@@ -404,12 +447,16 @@ Alt text is supplied per image with repeatable `--alt-text` flags (the count
 must match `--image`), and the `alt` field is always present — an empty
 string when no alt text is given, as the lexicon requires. Each string is
 capped at 2,000 characters; the lexicon itself sets no `maxLength` on `alt`,
-so this simply mirrors the official composer. As with the original, stripping
-EXIF metadata before upload remains the client's responsibility.
+so this simply mirrors the official composer.
 
-All four images are read and validated *before* the first blob is uploaded,
-so a typo in the fourth filename fails the post without leaving three
-orphaned blobs behind.
+**Your image's metadata is published with it.** Because the script uploads
+the file byte for byte, any EXIF metadata in it, including GPS location and
+camera details, becomes part of the public blob. The Bluesky app displays
+re-encoded copies, but the original blob can be downloaded by anyone through
+`com.atproto.sync.getBlob`. As with the original script, stripping metadata is
+up to you: remove it before posting if it could identify you or your location.
+Bear in mind that blanket metadata strippers also remove any data you have
+deliberately embedded in those segments.
 
 The upload itself is unchanged in principle: bytes go to
 `com.atproto.repo.uploadBlob`, and the returned `blob` object is embedded in
@@ -435,9 +482,17 @@ points to. The fork's changes:
   `Content-Type` header (falling back to a BOM, an in-document
   `<meta charset>`, and byte sniffing), so a page served in a non-UTF-8
   encoding still yields correct card text;
-* the HTML download is capped at 4 MB and the thumbnail at 1 MB;
+* a page that declares a non-HTML `Content-Type` (a PDF, a video) is refused
+  before its body is downloaded; one that declares no type is still read;
+* the HTML download is capped at 4 MB, and the thumbnail at 1 MB, which is
+  also the lexicon's `maxSize` for `app.bsky.embed.external` thumbnails;
+* only the page's `<head>` is parsed (everything before `</head>`, or before
+  `<body>` when the page omits it, up to 1 MB), since that is where the
+  metadata lives;
 * `og:` properties are matched case-insensitively, since real pages do emit
-  `property="OG:Title"`;
+  `property="OG:Title"`, and their values are trimmed, so an `og:image`
+  padded with newlines still loads and a blank `og:title` falls back to
+  `<title>`;
 * card titles and descriptions are capped at 300 and 1,000 Unicode code points
   respectively. Truncation makes a best-effort adjustment for combining marks
   and dangling zero-width joiners, but does not implement full Unicode grapheme
@@ -503,10 +558,11 @@ Parsing a link card's HTML and extracting all its metadata share a five-second
 budget, separate from the download deadline. Title text is traversed iteratively
 and copied only up to the card-title bound, so nested markup does not recurse
 through Python's stack. Malformed metadata falls back to a URL-only card.
-`html.parser` is pure Python: 4 MB of ordinary prose parses in about a second,
-but 4 MB of pathological shallow markup — which a hostile page is free to
-serve — measured closer to thirteen. A page that exceeds the parse budget loses
-its card metadata; the URL remains in the post.
+`html.parser` is pure Python and slow on pathological markup, which a hostile
+page is free to serve. Parsing only the page's head (at most 1 MB) keeps real
+pages far inside the budget, and the budget still bounds a page whose head is
+stuffed with hostile markup. A page that exceeds the parse budget loses its
+card metadata; the URL remains in the post.
 
 This has a consequence worth spelling out. A blocking call that blows its
 deadline is *abandoned* in a daemon thread rather than cancelled — Python
@@ -522,23 +578,36 @@ timeout leaves that mention as plain text; a thumbnail upload timeout omits
 the thumbnail. Required operations, such as login, reply/quote lookups, attached
 image uploads, and creating the post, still stop the command on failure.
 
-A **`createRecord` timeout leaves the posting outcome uncertain**: the PDS may
-have committed the post before its response was lost. The script does not
-supply a persistent record key or automatically retry that write. Re-running
-the command can create a duplicate, so check your account's recent posts and
-resolve whether the first attempt succeeded before retrying. Session isolation
-protects local connection state; it does not undo server-side effects.
+Deadlines are sized to the work. Mention lookups share one 20-second budget,
+and an image upload gets 30 seconds plus one second per 32 KB, so a 2 MB image
+still fits on a slow (about 256 kbit/s) uplink.
+
+**Settling an ambiguous `createRecord`.** A timeout, a dropped connection, a
+broken response, or a 5xx from a gateway in front of the PDS leaves the
+outcome uncertain: the PDS may have committed the post before its response was
+lost. Because the script chose the record key, it can find out. It looks the
+key up with `com.atproto.repo.getRecord`; if the post exists, that is the
+result. If not, it retries once with the *same* key. A key can hold only one
+record, so even if the first attempt lands late, one of the two writes is
+rejected and a second lookup finds the other: at most one post is ever
+created. A definite 4xx rejection is reported as-is, without a retry. If even
+the lookups fail, the command reports an error, and the post may or may not
+exist, so check your profile before running it again, because a new run uses
+a new key.
 
 A distinct `DeadlineExceeded` exception separates an abandoned worker from
 Requests' own `ConnectTimeout`/`ReadTimeout`. The latter leave no script worker
 running that operation and permit trying the next validated address during an
-external GET. That address fallback is not a retry policy for API writes.
+external GET. That address fallback is separate from the single, same-key
+`createRecord` retry above; no other API write is retried.
 
 **Size caps and content checks.** Response bodies are streamed with a byte limit
-applied to decoded data. The pinned urllib3 2.7.0 also bounds how much data is
+applied to decoded data. The pinned urllib3 2.8.0 also bounds how much data is
 expanded internally before yielding each chunk; checking chunks alone cannot
-protect an application using an older unbounded decoder. Older or unrecognized
-versions therefore refuse compressed responses before reading. Requests use
+protect an application using an older unbounded decoder. It also fixes an
+infinite loop in chunked deflate streaming and unbounded buffering of a
+chunk-size line, both of which a hostile server could trigger. Older or
+unrecognized versions therefore refuse compressed responses before reading. Requests use
 `Accept-Encoding: identity`, but gzip/x-gzip and deflate responses are supported
 with the patched decoder. Other codings, including optional Brotli backends,
 are refused. A declared `Content-Length` is an early size check only for
@@ -562,22 +631,30 @@ The complete script is a single file, `create_bsky_post.py`. Run
 `--help` for the full option list. `--verbose` prints the complete pending
 record before it is sent, plus the full body of a failed `createRecord`,
 which is the quickest way to see the facets and embeds this post has been
-describing:
+describing. It is not a dry run: the post is still published, so try it with
+text you are happy to post:
 
 ```bash
-python3 create_bsky_post.py "Hello, @alice.test! #greetings" --verbose
+python3 create_bsky_post.py "Testing my posting script #greetings" --verbose
 ```
 
 It also ships with a built-in test suite covering the facet parsers, URI
 validation, SSRF checks (including NAT64-translated addresses), IDN
 resolution, redirect handling and limits, response size and content-encoding
-limits, image file safety, login error reporting, terminal-safe rendering of
-server-supplied text, the link-card parse budget, and the card and thumbnail
-degradation paths:
+limits, image file safety, login and logout, error reporting, terminal-safe
+rendering of server-supplied text, the link-card parse budget, the card and
+thumbnail degradation paths, and the settling of an ambiguous `createRecord`:
 
 ```bash
 python3 create_bsky_post.py --self-test
 ```
+
+The Python excerpts in this post are checked against the script by
+`verify_doc_excerpts.py`. Each excerpt's complete statements must match a
+contiguous statement sequence in the script's syntax tree. Comments and
+formatting are ignored, but statement order, nesting, exception types, and
+literal values are checked, and no elisions are accepted. The checker also
+parses every JSON example.
 
 As the original post said: most people should use an SDK for their language
 of choice. But sometimes it's helpful to see what's actually going on behind
